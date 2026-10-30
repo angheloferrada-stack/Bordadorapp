@@ -702,6 +702,12 @@ class MainWindow(QMainWindow):
                 row.addWidget(b)
                 self.sel_buttons.append(b)
             v.addLayout(row)
+        self.hole_btn = QPushButton("⭕  Hacer agujero")
+        self.hole_btn.clicked.connect(self.make_hole)
+        v.addWidget(self.hole_btn)
+        v.addWidget(self._hint("Para un hueco (como el centro de una flor): dibuja la forma, "
+                               "dibuja el hueco encima, elige las dos con Shift y pulsa "
+                               "Hacer agujero. La de arriba se resta de la de abajo."))
 
         # 3. Cómo se borda
         v.addWidget(self._title("3. Cómo se borda"))
@@ -954,6 +960,23 @@ class MainWindow(QMainWindow):
                     sh.width *= f
         self.refresh()
 
+    def make_hole(self):
+        """Resta la forma de arriba (la más reciente) de la de abajo: queda un hueco."""
+        idx = sorted(i for i in self.canvas.sel if i < len(self.shapes))
+        if len(idx) != 2:
+            self.statusBar().showMessage("Elige 2 formas: la de abajo y la del hueco.", 6000)
+            return
+        base_i, hole_i = idx
+        base, hole = self.shapes[base_i], self.shapes[hole_i]
+        if base.kind != "fill":
+            self.statusBar().showMessage("El hueco solo sirve con formas de relleno.", 6000)
+            return
+        self.remember()
+        base.rings = [r.copy() for r in base.rings] + [r.copy() for r in hole.rings]
+        del self.shapes[hole_i]
+        self.canvas.select_only(base_i)
+        self.sync_panel()
+
     def on_hoop(self, _value=None):
         if self._updating:
             return
@@ -1115,6 +1138,7 @@ class MainWindow(QMainWindow):
         for b in self.sel_buttons:
             b.setEnabled(has)
         self.btn_delete.setEnabled(has)
+        self.hole_btn.setEnabled(len(self.canvas.sel) == 2)
         self.angle_slider.setEnabled(has)
         self.spacing_box.setEnabled(has)
         self.satin_spin.setEnabled(has)
