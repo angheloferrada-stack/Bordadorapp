@@ -7,6 +7,7 @@ Flujo:
   3. Elige relleno o contorno, el color y la dirección de las puntadas.
   4. Guarda el .dst y pásalo a la bordadora por USB.
 """
+import math
 import sys
 
 import numpy as np
@@ -30,6 +31,7 @@ COLORS = {
 RULER = 34   # ancho de las reglas laterales (px)
 TOP = 26     # alto de la regla de arriba (px)
 PAD = 12     # espacio entre reglas y bastidor (px)
+ZOOM_MIN, ZOOM_MAX = 0.5, 12.0
 
 STYLE = """
 QWidget#panel { background: #ffffff; }
@@ -56,6 +58,14 @@ def _steps(s):
     return major // 5, major   # (marca chica, marca grande en mm)
 
 
+def _ticks(lo, hi, step, top):
+    """Marcas de la regla (en mm) entre lo y hi, dentro de 0..top."""
+    lo, hi = max(0.0, lo), min(float(top), hi)
+    if hi < lo:
+        return []
+    return [k * step for k in range(math.ceil(lo / step), math.floor(hi / step) + 1)]
+
+
 def _dist(a, b):
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
 
@@ -68,28 +78,84 @@ class Canvas(QWidget):
         self.win = win
         self.mode = "draw_fill"   # "draw_fill", "draw_satin" o "select"
         self.in_progress = []     # puntos de la forma que se está dibujando
-        self.selected = -1
+        self.sel = set()          # índices de las formas seleccionadas
+        self.selected = -1        # la última tocada: la que muestra el panel
+        self.zoom = 1.0           # 1.0 = todo el bastidor visible
+        self.pan = [0.0, 0.0]     # desplazamiento de la vista (px)
         self._drag = None         # (tipo, inicio, valor original, historial)
-        self._dragged = -1        # forma que se está arrastrando
+        self._dragged = set()     # formas que se están arrastrando
         self._moved = False
+        self._marq_base = set()   # selección previa al recuadro (con Shift)
+        self._marq_now = (0.0, 0.0)
         self.setMinimumSize(760, 540)
         self.setFocusPolicy(Qt.StrongFocus)
 
+    # --- selección ---
+
+    def select_only(self, i):
+        self.sel = {i} if i >= 0 else set()
+        self.selected = i
+
+    def clear_sel(self):
+        self.select_only(-1)
+
+    def toggle(self, i):
+        if i in self.sel:
+            self.sel.discard(i)
+            self.selected = max(self.sel) if self.sel else -1
+        else:
+            self.sel.add(i)
+            self.selected = i
+
+    def _select_in_rect(self, a, b):
+        """Selecciona las formas que tocan el recuadro entre a y b (en mm)."""
+        rx0, rx1 = sorted((a[0], b[0]))
+        ry0, ry1 = sorted((a[1], b[1]))
+        hits = set()
+        for i, sh in enumerate(self.win.shapes):
+            bb = E.bbox_of([sh]) if sh.is_valid() else None
+            if bb is None:
+                continue
+            mn, mx = bb
+            if mx[0] >= rx0 and mn[0] <= rx1 and mx[1] >= ry0 and mn[1] <= ry1:
+                hits.add(i)
+        self.sel = self._marq_base | hits
+        self.selected = max(self.sel) if self.sel else -1
+
     # --- vista: mm <-> píxeles ---
 
-    def view(self):
+    def _layout(self, zoom, pan):
         W, H = self.width(), self.height()
         hw, hh = self.win.hoop
         avail_w = W - 2 * (RULER + PAD)
         avail_h = H - (TOP + PAD) - PAD
-        s = max(0.01, min(avail_w / hw, avail_h / hh))
-        ox = (W - hw * s) / 2
-        oy = TOP + PAD + (avail_h - hh * s) / 2
+        s = max(0.01, min(avail_w / hw, avail_h / hh)) * zoom
+        ox = (W - hw * s) / 2 + pan[0]
+        oy = TOP + PAD + (avail_h - hh * s) / 2 + pan[1]
         return s, ox, oy
+
+    def view(self):
+        return self._layout(self.zoom, self.pan)
 
     def to_mm(self, pos):
         s, ox, oy = self.view()
         return ((pos.x() - ox) / s, (pos.y() - oy) / s)
+
+    def zoom_at(self, pos, factor):
+        """Acerca o aleja manteniendo fijo el punto bajo el cursor."""
+        mm = self.to_mm(pos)
+        self.zoom = min(ZOOM_MAX, max(ZOOM_MIN, self.zoom * factor))
+        s, ox, oy = self._layout(self.zoom, (0.0, 0.0))
+        self.pan = [pos.x() - ox - mm[0] * s, pos.y() - oy - mm[1] * s]
+        self.update()
+
+    def zoom_center(self, factor):
+        self.zoom_at(QPointF(self.width() / 2, self.height() / 2), factor)
+
+    def reset_view(self):
+        self.zoom = 1.0
+        self.pan = [0.0, 0.0]
+        self.update()
 
     @staticmethod
     def _poly(arr, v):
@@ -160,13 +226,13 @@ class Canvas(QWidget):
                 p.drawPath(path)
 
             # Vista previa de las puntadas (no se dibuja mientras la mueves).
-            if i != self._dragged:
+            if i not in self._dragged:
                 p.setBrush(Qt.NoBrush)
                 p.setPen(QPen(QColor(col.red(), col.green(), col.blue(), 170), 1))
                 for poly in self._stitch_polys(sh, v):
                     p.drawPolyline(poly)
 
-            if i == self.selected:
+            if i in self.sel:
                 p.setBrush(Qt.NoBrush)
                 p.setPen(QPen(QColor("#2563eb"), 2, Qt.DashLine))
                 p.drawPath(path)
@@ -184,6 +250,16 @@ class Canvas(QWidget):
             p.drawText(QPointF(rect.left(), rect.top() - 6),
                        f"Diseño: {mx[0] - mn[0]:.0f} × {mx[1] - mn[1]:.0f} mm")
 
+        # Recuadro de selección que se está dibujando.
+        if self._drag and self._drag[0] == "marquee":
+            x0, y0 = self._drag[1]
+            x1, y1 = self._marq_now
+            r = QRectF(QPointF(ox + x0 * s, oy + y0 * s),
+                       QPointF(ox + x1 * s, oy + y1 * s)).normalized()
+            p.setPen(QPen(QColor("#2563eb"), 1, Qt.DashLine))
+            p.setBrush(QColor(37, 99, 235, 30))
+            p.drawRect(r)
+
         if self.in_progress:
             pts = np.asarray(self.in_progress, dtype=float)
             p.setPen(QPen(QColor("#2563eb"), 2))
@@ -198,38 +274,41 @@ class Canvas(QWidget):
         p.end()
 
     def _rulers(self, p, v):
+        """Reglas pegadas a los bordes de la vista: muestran los mm que se ven."""
         s, ox, oy = v
+        W, H = self.width(), self.height()
         hw, hh = self.win.hoop
         minor, major = _steps(s)
-        right_x = ox + hw * s
         p.setPen(Qt.NoPen)
         p.setBrush(QColor("#f8fafc"))
-        p.drawRect(QRectF(ox, oy - TOP, hw * s, TOP))
-        p.drawRect(QRectF(ox - RULER, oy, RULER - 4, hh * s))
-        p.drawRect(QRectF(right_x + 4, oy, RULER - 4, hh * s))
+        p.drawRect(QRectF(0, 0, W, TOP))
+        p.drawRect(QRectF(0, 0, RULER, H))
+        p.drawRect(QRectF(W - RULER, 0, RULER, H))
 
         font = QFont()
         font.setPixelSize(10)
         p.setFont(font)
         p.setPen(QPen(QColor("#475569"), 1))
-        p.drawText(QRectF(ox - RULER, oy - TOP, RULER - 4, TOP), Qt.AlignCenter, "mm")
+        p.drawText(QRectF(0, 0, RULER, TOP), Qt.AlignCenter, "mm")
 
-        for mm in range(0, int(hw) + 1, minor):
+        # Regla de arriba: a lo largo del ancho del bastidor.
+        for mm in _ticks((RULER - ox) / s, (W - RULER - ox) / s, minor, hw):
             x = ox + mm * s
             big = mm % major == 0
-            p.drawLine(QPointF(x, oy - 4), QPointF(x, oy - (12 if big else 7)))
+            p.drawLine(QPointF(x, TOP - 4), QPointF(x, TOP - (12 if big else 7)))
             if big:
-                p.drawText(QPointF(x + 3, oy - 8), str(mm))
+                p.drawText(QPointF(x + 3, TOP - 8), str(mm))
 
-        for mm in range(0, int(hh) + 1, minor):
+        # Reglas de los lados: a lo largo del alto del bastidor.
+        for mm in _ticks((TOP - oy) / s, (H - oy) / s, minor, hh):
             y = oy + mm * s
             big = mm % major == 0
-            p.drawLine(QPointF(ox - 4, y), QPointF(ox - (12 if big else 7), y))
-            p.drawLine(QPointF(right_x + 4, y), QPointF(right_x + (12 if big else 7), y))
+            p.drawLine(QPointF(RULER - 4, y), QPointF(RULER - (12 if big else 7), y))
+            p.drawLine(QPointF(W - RULER + 4, y), QPointF(W - RULER + (12 if big else 7), y))
             if big:
-                p.drawText(QRectF(ox - RULER, y + 1, RULER - 14, 12),
+                p.drawText(QRectF(0, y + 1, RULER - 14, 12),
                            Qt.AlignRight | Qt.AlignVCenter, str(mm))
-                p.drawText(QRectF(right_x + 14, y + 1, RULER - 14, 12),
+                p.drawText(QRectF(W - RULER + 14, y + 1, RULER - 14, 12),
                            Qt.AlignLeft | Qt.AlignVCenter, str(mm))
 
     # --- ratón y teclado ---
@@ -239,7 +318,15 @@ class Canvas(QWidget):
         hgt = bg["w"] * bg["img"].height() / bg["img"].width()
         return bg["x"] <= x <= bg["x"] + bg["w"] and bg["y"] <= y <= bg["y"] + hgt
 
+    def wheelEvent(self, e):
+        dy = e.angleDelta().y()
+        if dy:
+            self.zoom_at(e.position(), 1.2 if dy > 0 else 1 / 1.2)
+
     def mousePressEvent(self, e):
+        if e.button() == Qt.MiddleButton:          # botón del medio: mover la vista
+            self._drag = ("pan", e.position(), list(self.pan), None)
+            return
         if e.button() != Qt.LeftButton:
             return
         x, y = self.to_mm(e.position())
@@ -254,19 +341,39 @@ class Canvas(QWidget):
             return
 
         # modo mover / elegir
-        self.selected = -1
+        shift = bool(e.modifiers() & Qt.ShiftModifier)
+        hit = -1
         for i in reversed(range(len(self.win.shapes))):
             sh = self.win.shapes[i]
             if sh.is_valid() and sh.contains(x, y):
-                self.selected = i
+                hit = i
                 break
-        if self.selected >= 0:
-            sh = self.win.shapes[self.selected]
-            self._drag = ("shape", (x, y), [r.copy() for r in sh.rings], self.win.snapshot())
-            self._dragged = self.selected
-        elif self.win.bg and self._in_bg(x, y):
+
+        if hit >= 0 and shift:
+            # Shift + clic: suma o quita esa forma de la selección.
+            self.toggle(hit)
+            self.win.sync_panel()
+            return
+        if hit >= 0:
+            if hit not in self.sel:
+                self.select_only(hit)
+            else:
+                self.selected = hit           # el grupo sigue seleccionado
+            ids = sorted(self.sel)
+            origs = {i: [r.copy() for r in self.win.shapes[i].rings] for i in ids}
+            self._drag = ("shape", (x, y), origs, self.win.snapshot())
+            self._dragged = set(ids)
+        elif self.win.bg and self._in_bg(x, y) and not shift:
+            self.clear_sel()
             bg = self.win.bg
             self._drag = ("bg", (x, y), (bg["x"], bg["y"]), None)
+        else:
+            # Espacio vacío: arrastra un recuadro para elegir varias formas.
+            self._marq_base = set(self.sel) if shift else set()
+            if not shift:
+                self.clear_sel()
+            self._drag = ("marquee", (x, y), (x, y), None)
+            self._marq_now = (x, y)
         self._moved = False
         self.win.sync_panel()
         self.update()
@@ -274,13 +381,23 @@ class Canvas(QWidget):
     def mouseMoveEvent(self, e):
         if not self._drag:
             return
-        x, y = self.to_mm(e.position())
         kind, start, orig, _ = self._drag
+        if kind == "pan":
+            dx = e.position().x() - start.x()
+            dy = e.position().y() - start.y()
+            self.pan = [orig[0] + dx, orig[1] + dy]
+            self.update()
+            return
+        x, y = self.to_mm(e.position())
         dx, dy = x - start[0], y - start[1]
         if dx or dy:
             self._moved = True
         if kind == "shape":
-            self.win.shapes[self._dragged].rings = [r + np.array([dx, dy]) for r in orig]
+            for i, rings in orig.items():
+                self.win.shapes[i].rings = [r + np.array([dx, dy]) for r in rings]
+        elif kind == "marquee":
+            self._marq_now = (x, y)
+            self._select_in_rect(start, (x, y))
         else:
             bg = self.win.bg
             bg["x"], bg["y"] = orig[0] + dx, orig[1] + dy
@@ -289,12 +406,15 @@ class Canvas(QWidget):
     def mouseReleaseEvent(self, _e):
         if not self._drag:
             return
-        _, _, _, before = self._drag
-        if self._moved and before is not None:
+        kind, _, _, before = self._drag
+        if kind != "pan" and self._moved and before is not None:
             self.win.push_history(before)
         self._drag = None
-        self._dragged = -1
-        self.win.refresh()
+        self._dragged = set()
+        if kind == "marquee":
+            self.win.sync_panel()
+        else:
+            self.win.refresh()
 
     def mouseDoubleClickEvent(self, e):
         if self.mode.startswith("draw") and len(self.in_progress) >= self._min_points():
@@ -307,8 +427,12 @@ class Canvas(QWidget):
         if e.key() in (Qt.Key_Return, Qt.Key_Enter):
             self.finish_shape()
         elif e.key() == Qt.Key_Escape:
-            self.in_progress = []
-            self.update()
+            if self.in_progress:
+                self.in_progress = []
+                self.update()
+            else:
+                self.clear_sel()
+                self.win.sync_panel()
         else:
             super().keyPressEvent(e)
 
@@ -322,7 +446,7 @@ class Canvas(QWidget):
             shape = E.Shape(pts, "fill")
         self.win.add_shape(shape)
         self.in_progress = []
-        self.selected = len(self.win.shapes) - 1
+        self.select_only(len(self.win.shapes) - 1)
         self.win.sync_panel()
         self.update()
 
@@ -357,7 +481,15 @@ class MainWindow(QMainWindow):
 
         QShortcut(QKeySequence("Ctrl+Z"), self, activated=self.undo)
         QShortcut(QKeySequence("Ctrl+S"), self, activated=self.save)
+        QShortcut(QKeySequence("Ctrl+A"), self, activated=self.select_all)
         QShortcut(QKeySequence(Qt.Key_Delete), self, activated=self.delete_selected)
+        QShortcut(QKeySequence(QKeySequence.StandardKey.ZoomIn), self,
+                  activated=lambda: self.canvas.zoom_center(1.25))
+        QShortcut(QKeySequence("Ctrl+="), self,
+                  activated=lambda: self.canvas.zoom_center(1.25))
+        QShortcut(QKeySequence(QKeySequence.StandardKey.ZoomOut), self,
+                  activated=lambda: self.canvas.zoom_center(0.8))
+        QShortcut(QKeySequence("Ctrl+0"), self, activated=lambda: self.canvas.reset_view())
 
         self.resize(1280, 800)
         self.sync_panel()
@@ -426,6 +558,19 @@ class MainWindow(QMainWindow):
         v.addWidget(self._hint("Pon el tamaño del bastidor que vas a usar. "
                                "El máximo es 380 × 260 mm."))
 
+        # Zoom: para ver de cerca los detalles
+        v.addWidget(self._title("Zoom"))
+        zrow = QHBoxLayout()
+        for text, fn in (("－ Alejar", lambda: self.canvas.zoom_center(0.8)),
+                         ("＋ Acercar", lambda: self.canvas.zoom_center(1.25)),
+                         ("Ver todo", lambda: self.canvas.reset_view())):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            zrow.addWidget(b)
+        v.addLayout(zrow)
+        v.addWidget(self._hint("Rueda del ratón o Ctrl + / Ctrl −. "
+                               "Para mover la vista, arrastra con el botón del medio."))
+
         # 1. Dibujar o mover
         v.addWidget(self._title("1. Dibuja o mueve"))
         self.btn_draw = QPushButton("✏  Dibujar forma")
@@ -442,7 +587,9 @@ class MainWindow(QMainWindow):
         v.addWidget(self.btn_satin)
         v.addWidget(self.btn_select)
         v.addWidget(self._hint("Forma: clic en cada punto; doble clic o Enter para cerrarla. "
-                               "Satén: clic en la línea; doble clic o Enter para terminar."))
+                               "Satén: clic en la línea; doble clic o Enter para terminar. "
+                               "Para elegir varias: Shift + clic, o arrastra un recuadro "
+                               "en el espacio vacío. Ctrl+A elige todo."))
 
         # 2. Ajustar la forma elegida
         v.addWidget(self._title("2. Ajusta la forma elegida"))
@@ -575,10 +722,23 @@ class MainWindow(QMainWindow):
     # --- estado ---
 
     def selected_shape(self):
+        """La forma que muestra el panel (la última tocada)."""
         i = self.canvas.selected
         if 0 <= i < len(self.shapes):
             return self.shapes[i]
         return None
+
+    def selected_shapes(self):
+        """Todas las formas seleccionadas."""
+        return [self.shapes[i] for i in sorted(self.canvas.sel) if i < len(self.shapes)]
+
+    def select_all(self):
+        if not self.shapes:
+            return
+        self.set_mode("select")
+        self.canvas.sel = set(range(len(self.shapes)))
+        self.canvas.selected = len(self.shapes) - 1
+        self.sync_panel()
 
     def snapshot(self):
         return [s.copy() for s in self.shapes]
@@ -599,23 +759,24 @@ class MainWindow(QMainWindow):
         if not self.history:
             return
         self.shapes = self.history.pop()
-        self.canvas.selected = -1
+        self.canvas.clear_sel()
         self.sync_panel()
 
     def delete_selected(self):
-        i = self.canvas.selected
-        if i < 0 or i >= len(self.shapes):
+        idx = [i for i in sorted(self.canvas.sel) if i < len(self.shapes)]
+        if not idx:
             return
         self.remember()
-        del self.shapes[i]
-        self.canvas.selected = -1
+        for i in reversed(idx):
+            del self.shapes[i]
+        self.canvas.clear_sel()
         self.sync_panel()
 
     def set_mode(self, mode):
         self.canvas.mode = mode
         self.canvas.in_progress = []
         if mode != "select":
-            self.canvas.selected = -1      # al dibujar, nada queda seleccionado
+            self.canvas.clear_sel()        # al dibujar, nada queda seleccionado
         self.btn_draw.setChecked(mode == "draw_fill")
         self.btn_satin.setChecked(mode == "draw_satin")
         self.btn_select.setChecked(mode == "select")
@@ -623,11 +784,23 @@ class MainWindow(QMainWindow):
         self.canvas.update()
 
     def transform(self, deg, factor):
-        sh = self.selected_shape()
-        if sh is None:
+        shs = self.selected_shapes()
+        if not shs:
             return
         self.remember()
-        sh.transform(deg, factor if factor else 1.0)
+        f = factor if factor else 1.0
+        if len(shs) == 1:
+            shs[0].transform(deg, f)
+        else:
+            # Varias formas: giran y crecen alrededor del centro del grupo.
+            mn, mx = E.bbox_of(shs)
+            c = (mn + mx) / 2
+            t = np.radians(deg)
+            rot = np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]])
+            for sh in shs:
+                sh.rings = [((r - c) @ rot.T) * f + c for r in sh.rings]
+                if sh.kind == "satin":
+                    sh.width *= f
         self.refresh()
 
     def on_hoop(self, _value=None):
@@ -656,46 +829,52 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def on_kind(self, idx):
-        sh = self.selected_shape()
-        if self._updating or sh is None:
+        shs = self.selected_shapes()
+        if self._updating or not shs:
             return
         self.remember()
-        sh.kind = ("fill", "run", "satin")[idx]
-        self.refresh()
+        kind = ("fill", "run", "satin")[idx]
+        for sh in shs:
+            sh.kind = kind
+        self.sync_panel()
 
     def on_angle(self, value):
         self.angle_label.setText(f"Dirección de las puntadas: {value}°")
-        sh = self.selected_shape()
-        if self._updating or sh is None:
+        shs = self.selected_shapes()
+        if self._updating or not shs:
             return
-        sh.fill_angle = float(value)
+        for sh in shs:
+            sh.fill_angle = float(value)
         self.refresh()
 
     def on_satin_width(self, value):
         if self._updating:
             return
         self.satin_width = float(value)
-        sh = self.selected_shape()
-        if sh is None or sh.kind != "satin":
+        sats = [sh for sh in self.selected_shapes() if sh.kind == "satin"]
+        if not sats:
             return
         self.remember()
-        sh.width = float(value)
+        for sh in sats:
+            sh.width = float(value)
         self.refresh()
 
     def on_spacing(self, value):
-        sh = self.selected_shape()
-        if self._updating or sh is None:
+        shs = self.selected_shapes()
+        if self._updating or not shs:
             return
         self.remember()
-        sh.spacing = float(value)
+        for sh in shs:
+            sh.spacing = float(value)
         self.refresh()
 
     def set_color(self, hexcol):
         self.current_color = hexcol
-        sh = self.selected_shape()
-        if sh is not None:
+        shs = self.selected_shapes()
+        if shs:
             self.remember()
-            sh.color = hexcol
+            for sh in shs:
+                sh.color = hexcol
         self.refresh()
 
     # --- importar y fondo ---
@@ -733,7 +912,7 @@ class MainWindow(QMainWindow):
         self.remember()
         E.center_shapes(shapes, hw / 2, hh / 2)
         self.shapes.extend(shapes)
-        self.canvas.selected = -1
+        self.canvas.clear_sel()
         self.sync_panel()
         if photo:
             QMessageBox.information(
@@ -835,6 +1014,9 @@ class MainWindow(QMainWindow):
             text = (f"Puntadas: {info['stitches']:,}\n"
                     f"Diseño: {info['width']:.0f} × {info['height']:.0f} mm\n"
                     f"Bastidor: {self.hoop[0]:g} × {self.hoop[1]:g} mm\n{cabe}")
+        n = len(self.canvas.sel)
+        if n > 1:
+            text = f"Seleccionadas: {n} formas\n" + text
         self.status.setText(text)
         self.canvas.update()
 
