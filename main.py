@@ -324,7 +324,9 @@ class Canvas(QWidget):
             self.zoom_at(e.position(), 1.2 if dy > 0 else 1 / 1.2)
 
     def mousePressEvent(self, e):
-        if e.button() == Qt.MiddleButton:          # botón del medio: mover la vista
+        ctrl = bool(e.modifiers() & Qt.ControlModifier)
+        if e.button() == Qt.MiddleButton or (e.button() == Qt.LeftButton and ctrl):
+            # Botón del medio, o Ctrl + arrastrar: mover la vista (sin tocar las formas)
             self._drag = ("pan", e.position(), list(self.pan), None)
             return
         if e.button() != Qt.LeftButton:
@@ -569,7 +571,8 @@ class MainWindow(QMainWindow):
             zrow.addWidget(b)
         v.addLayout(zrow)
         v.addWidget(self._hint("Rueda del ratón o Ctrl + / Ctrl −. "
-                               "Para mover la vista, arrastra con el botón del medio."))
+                               "Para mover la vista, mantén Ctrl y arrastra "
+                               "(o usa el botón del medio)."))
 
         # 1. Dibujar o mover
         v.addWidget(self._title("1. Dibuja o mueve"))
