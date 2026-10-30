@@ -1,18 +1,22 @@
 """Diseñador de bordados simple (inspirado en Wings XP).
 
 Flujo:
-  1. Dibuja una forma (clic en cada punto, doble clic para cerrarla).
-  2. Elige si es relleno o contorno, el color y la dirección de las puntadas.
-  3. Guarda el .dst y pásalo a la bordadora por USB.
+  1. Pon el tamaño del bastidor que vas a usar.
+  2. Dibuja una forma (clic en cada punto, doble clic para cerrarla),
+     o importa una foto o un vector SVG.
+  3. Elige relleno o contorno, el color y la dirección de las puntadas.
+  4. Guarda el .dst y pásalo a la bordadora por USB.
 """
 import sys
 
-from PySide6.QtCore import Qt, QPointF, QRectF
-from PySide6.QtGui import QColor, QKeySequence, QPainter, QPen, QPolygonF, QShortcut
+import numpy as np
+from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter,
+                           QPainterPath, QPen, QPolygonF, QShortcut)
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout,
-    QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QSlider,
-    QVBoxLayout, QWidget,
+    QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
+    QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMessageBox, QPushButton,
+    QScrollArea, QSlider, QVBoxLayout, QWidget,
 )
 
 import engine as E
@@ -23,11 +27,15 @@ COLORS = {
     "Morado": "#7e22ce", "Café": "#78350f",
 }
 
+RULER = 34   # ancho de las reglas laterales (px)
+TOP = 26     # alto de la regla de arriba (px)
+PAD = 12     # espacio entre reglas y bastidor (px)
+
 STYLE = """
 QWidget#panel { background: #ffffff; }
 QPushButton {
     background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 8px;
-    padding: 8px; font-size: 13px; color: #0f172a;
+    padding: 7px; font-size: 13px; color: #0f172a;
 }
 QPushButton:hover   { background: #e2e8f0; }
 QPushButton:checked { background: #2563eb; color: white; border-color: #2563eb; }
@@ -37,7 +45,19 @@ QPushButton#save {
 }
 QPushButton#save:hover { background: #15803d; }
 QLabel#status { background: #f8fafc; border-radius: 8px; padding: 8px; color: #334155; }
+QLabel#title  { font-weight: 600; font-size: 13px; color: #0f172a; margin-top: 10px; }
+QLabel#hint   { color: #64748b; font-size: 11px; }
 """
+
+
+def _steps(s):
+    """Separación de las marcas de la regla, según el zoom."""
+    major = next((m for m in (10, 20, 50, 100, 200, 500) if m * s >= 40), 500)
+    return major // 5, major   # (marca chica, marca grande en mm)
+
+
+def _dist(a, b):
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
 
 
 class Canvas(QWidget):
@@ -49,89 +69,175 @@ class Canvas(QWidget):
         self.mode = "draw"        # "draw" o "select"
         self.in_progress = []     # puntos de la forma que se está dibujando
         self.selected = -1
-        self._drag_start = None
-        self._drag_orig = None
-        self._drag_before = None
-        self.setMinimumSize(700, 500)
+        self._drag = None         # (tipo, inicio, valor original, historial)
+        self._dragged = -1        # forma que se está arrastrando
+        self._moved = False
+        self.setMinimumSize(760, 540)
         self.setFocusPolicy(Qt.StrongFocus)
 
-    # --- conversión mm <-> píxeles ---
+    # --- vista: mm <-> píxeles ---
 
-    def _scale(self):
-        m = 36
-        s = min((self.width() - 2 * m) / E.HOOP_W_MM,
-                (self.height() - 2 * m) / E.HOOP_H_MM)
-        return s, (self.width() - E.HOOP_W_MM * s) / 2, (self.height() - E.HOOP_H_MM * s) / 2
-
-    def to_px(self, x, y):
-        s, ox, oy = self._scale()
-        return QPointF(ox + x * s, oy + y * s)
+    def view(self):
+        W, H = self.width(), self.height()
+        hw, hh = self.win.hoop
+        avail_w = W - 2 * (RULER + PAD)
+        avail_h = H - (TOP + PAD) - PAD
+        s = max(0.01, min(avail_w / hw, avail_h / hh))
+        ox = (W - hw * s) / 2
+        oy = TOP + PAD + (avail_h - hh * s) / 2
+        return s, ox, oy
 
     def to_mm(self, pos):
-        s, ox, oy = self._scale()
+        s, ox, oy = self.view()
         return ((pos.x() - ox) / s, (pos.y() - oy) / s)
+
+    @staticmethod
+    def _poly(arr, v):
+        s, ox, oy = v
+        pts = (np.asarray(arr, dtype=float) * s + [ox, oy]).tolist()
+        return QPolygonF([QPointF(x, y) for x, y in pts])
+
+    def _stitch_polys(self, sh, v):
+        """Trazos de puntadas ya pasados a píxeles. Se reutilizan mientras no cambie la forma ni la vista."""
+        if not hasattr(self, "_pcache"):
+            self._pcache = {}
+        lines = sh.polylines()
+        hit = self._pcache.get(id(sh))
+        if hit and hit[0] is lines and hit[1] == v:
+            return hit[2]
+        polys = [self._poly(line, v) for line in lines if len(line) > 1]
+        self._pcache[id(sh)] = (lines, v, polys)
+        return polys
 
     # --- dibujo ---
 
     def paintEvent(self, _event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        v = self.view()
+        s, ox, oy = v
+        hw, hh = self.win.hoop
         p.fillRect(self.rect(), QColor("#f1f5f9"))
 
-        s, ox, oy = self._scale()
-        hoop = QRectF(ox, oy, E.HOOP_W_MM * s, E.HOOP_H_MM * s)
+        hoop = QRectF(ox, oy, hw * s, hh * s)
         p.fillRect(hoop, QColor("white"))
+
+        bg = self.win.bg
+        if bg:
+            img = bg["img"]
+            hgt = bg["w"] * img.height() / img.width()
+            p.setOpacity(bg["opacity"])
+            p.drawImage(QRectF(ox + bg["x"] * s, oy + bg["y"] * s, bg["w"] * s, hgt * s), img)
+            p.setOpacity(1.0)
+
         p.setPen(QPen(QColor("#94a3b8"), 1.5, Qt.DashLine))
+        p.setBrush(Qt.NoBrush)
         p.drawRect(hoop)
-        p.setPen(QColor("#64748b"))
-        p.drawText(hoop.adjusted(10, 6, 0, 0), Qt.AlignTop | Qt.AlignLeft,
-                   "Bastidor 380 × 260 mm")
 
         for i, sh in enumerate(self.win.shapes):
+            if not sh.is_valid():
+                continue
             col = QColor(sh.color)
-            fill = QColor(col.red(), col.green(), col.blue(), 45)
-            poly = QPolygonF([self.to_px(x, y) for x, y in sh.points])
+            path = QPainterPath()
+            path.setFillRule(Qt.OddEvenFill)   # agujeros como en las letras
+            for r in sh.rings:
+                if len(r) >= 3:
+                    path.addPolygon(self._poly(r, v))
+                    path.closeSubpath()
+            p.setBrush(QColor(col.red(), col.green(), col.blue(), 45)
+                       if sh.kind == "fill" else Qt.NoBrush)
+            p.setPen(QPen(col, 1.5))
+            p.drawPath(path)
 
-            # Vista previa de las puntadas: así se ve hacia dónde van.
-            p.setPen(QPen(QColor(col.red(), col.green(), col.blue(), 140), 1))
-            for line in E.shape_polylines(sh):
-                for (x1, y1), (x2, y2) in zip(line, line[1:]):
-                    p.drawLine(self.to_px(x1, y1), self.to_px(x2, y2))
+            # Vista previa de las puntadas (no se dibuja mientras la mueves).
+            if i != self._dragged:
+                p.setBrush(Qt.NoBrush)
+                p.setPen(QPen(QColor(col.red(), col.green(), col.blue(), 170), 1))
+                for poly in self._stitch_polys(sh, v):
+                    p.drawPolyline(poly)
 
-            p.setBrush(fill)
-            p.setPen(QPen(col, 2))
-            p.drawPolygon(poly)
             if i == self.selected:
                 p.setBrush(Qt.NoBrush)
-                p.setPen(QPen(QColor("#2563eb"), 2.5, Qt.DashLine))
-                p.drawPolygon(poly)
+                p.setPen(QPen(QColor("#2563eb"), 2, Qt.DashLine))
+                p.drawPath(path)
+
+        # Medidas del diseño completo.
+        b = E.bbox_of(self.win.shapes)
+        if b is not None:
+            mn, mx = b
+            rect = QRectF(QPointF(ox + mn[0] * s, oy + mn[1] * s),
+                          QPointF(ox + mx[0] * s, oy + mx[1] * s))
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor("#475569"), 1, Qt.DashDotLine))
+            p.drawRect(rect)
+            p.setPen(QColor("#334155"))
+            p.drawText(QPointF(rect.left(), rect.top() - 6),
+                       f"Diseño: {mx[0] - mn[0]:.0f} × {mx[1] - mn[1]:.0f} mm")
 
         if self.in_progress:
-            pts = [self.to_px(x, y) for x, y in self.in_progress]
-            p.setBrush(Qt.NoBrush)
+            pts = np.asarray(self.in_progress, dtype=float)
             p.setPen(QPen(QColor("#2563eb"), 2))
-            p.drawPolyline(QPolygonF(pts))
+            p.setBrush(Qt.NoBrush)
+            p.drawPolyline(self._poly(pts, v))
+            p.setPen(Qt.NoPen)
             p.setBrush(QColor("#2563eb"))
-            for q in pts:
-                p.drawEllipse(q, 4, 4)
+            for x, y in self.in_progress:
+                p.drawEllipse(QPointF(ox + x * s, oy + y * s), 4, 4)
+
+        self._rulers(p, v)
         p.end()
+
+    def _rulers(self, p, v):
+        s, ox, oy = v
+        hw, hh = self.win.hoop
+        minor, major = _steps(s)
+        right_x = ox + hw * s
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#f8fafc"))
+        p.drawRect(QRectF(ox, oy - TOP, hw * s, TOP))
+        p.drawRect(QRectF(ox - RULER, oy, RULER - 4, hh * s))
+        p.drawRect(QRectF(right_x + 4, oy, RULER - 4, hh * s))
+
+        font = QFont()
+        font.setPixelSize(10)
+        p.setFont(font)
+        p.setPen(QPen(QColor("#475569"), 1))
+        p.drawText(QRectF(ox - RULER, oy - TOP, RULER - 4, TOP), Qt.AlignCenter, "mm")
+
+        for mm in range(0, int(hw) + 1, minor):
+            x = ox + mm * s
+            big = mm % major == 0
+            p.drawLine(QPointF(x, oy - 4), QPointF(x, oy - (12 if big else 7)))
+            if big:
+                p.drawText(QPointF(x + 3, oy - 8), str(mm))
+
+        for mm in range(0, int(hh) + 1, minor):
+            y = oy + mm * s
+            big = mm % major == 0
+            p.drawLine(QPointF(ox - 4, y), QPointF(ox - (12 if big else 7), y))
+            p.drawLine(QPointF(right_x + 4, y), QPointF(right_x + (12 if big else 7), y))
+            if big:
+                p.drawText(QRectF(ox - RULER, y + 1, RULER - 14, 12),
+                           Qt.AlignRight | Qt.AlignVCenter, str(mm))
+                p.drawText(QRectF(right_x + 14, y + 1, RULER - 14, 12),
+                           Qt.AlignLeft | Qt.AlignVCenter, str(mm))
 
     # --- ratón y teclado ---
 
-    @staticmethod
-    def _dist(a, b):
-        return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+    def _in_bg(self, x, y):
+        bg = self.win.bg
+        hgt = bg["w"] * bg["img"].height() / bg["img"].width()
+        return bg["x"] <= x <= bg["x"] + bg["w"] and bg["y"] <= y <= bg["y"] + hgt
 
     def mousePressEvent(self, e):
         if e.button() != Qt.LeftButton:
             return
         x, y = self.to_mm(e.position())
         if self.mode == "draw":
-            if (len(self.in_progress) >= 3
-                    and self._dist(self.in_progress[0], (x, y)) < 2.5):
+            if len(self.in_progress) >= 3 and _dist(self.in_progress[0], (x, y)) < 2.5:
                 self.finish_shape()
                 return
-            if not self.in_progress or self._dist(self.in_progress[-1], (x, y)) > 0.5:
+            if not self.in_progress or _dist(self.in_progress[-1], (x, y)) > 0.5:
                 self.in_progress.append((x, y))
             self.update()
             return
@@ -139,32 +245,45 @@ class Canvas(QWidget):
         # modo mover / elegir
         self.selected = -1
         for i in reversed(range(len(self.win.shapes))):
-            if E.contains(self.win.shapes[i].points, x, y):
+            sh = self.win.shapes[i]
+            if sh.is_valid() and sh.contains(x, y):
                 self.selected = i
                 break
         if self.selected >= 0:
-            self._drag_start = (x, y)
-            self._drag_orig = list(self.win.shapes[self.selected].points)
-            self._drag_before = self.win.snapshot()
+            sh = self.win.shapes[self.selected]
+            self._drag = ("shape", (x, y), [r.copy() for r in sh.rings], self.win.snapshot())
+            self._dragged = self.selected
+        elif self.win.bg and self._in_bg(x, y):
+            bg = self.win.bg
+            self._drag = ("bg", (x, y), (bg["x"], bg["y"]), None)
+        self._moved = False
         self.win.sync_panel()
         self.update()
 
     def mouseMoveEvent(self, e):
-        if self._drag_start is None:
+        if not self._drag:
             return
         x, y = self.to_mm(e.position())
-        dx, dy = x - self._drag_start[0], y - self._drag_start[1]
-        self.win.shapes[self.selected].points = E.translate(self._drag_orig, dx, dy)
+        kind, start, orig, _ = self._drag
+        dx, dy = x - start[0], y - start[1]
+        if dx or dy:
+            self._moved = True
+        if kind == "shape":
+            self.win.shapes[self._dragged].rings = [r + np.array([dx, dy]) for r in orig]
+        else:
+            bg = self.win.bg
+            bg["x"], bg["y"] = orig[0] + dx, orig[1] + dy
         self.update()
 
     def mouseReleaseEvent(self, _e):
-        if self._drag_start is not None:
-            moved = self.win.shapes[self.selected].points != self._drag_orig
-            if moved:
-                self.win.push_history(self._drag_before)
-            self._drag_start = None
-            self._drag_orig = None
-            self.win.refresh()
+        if not self._drag:
+            return
+        _, _, _, before = self._drag
+        if self._moved and before is not None:
+            self.win.push_history(before)
+        self._drag = None
+        self._dragged = -1
+        self.win.refresh()
 
     def mouseDoubleClickEvent(self, e):
         if self.mode == "draw" and len(self.in_progress) >= 3:
@@ -182,7 +301,7 @@ class Canvas(QWidget):
     def finish_shape(self):
         if len(self.in_progress) < 3:
             return
-        self.win.add_shape(E.Shape(self.in_progress))
+        self.win.add_shape(E.Shape(np.array(self.in_progress, dtype=float)))
         self.in_progress = []
         self.selected = len(self.win.shapes) - 1
         self.win.sync_panel()
@@ -195,14 +314,23 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Bordado simple")
         self.shapes = []
         self.history = []
+        self.hoop = list(E.DEFAULT_HOOP)   # (ancho, alto) en mm
+        self.bg = None                     # foto de fondo para calcar
         self.current_color = COLORS["Azul"]
         self._updating = False
 
         self.canvas = Canvas(self)
+        panel = self._build_panel()
+        scroll = QScrollArea()
+        scroll.setWidget(panel)
+        scroll.setWidgetResizable(True)
+        scroll.setFixedWidth(300)
+        scroll.setFrameShape(QFrame.NoFrame)
+
         root = QWidget()
         lay = QHBoxLayout(root)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(self._build_panel())
+        lay.addWidget(scroll)
         lay.addWidget(self.canvas, 1)
         self.setCentralWidget(root)
         self.setStyleSheet(STYLE)
@@ -211,29 +339,48 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+S"), self, activated=self.save)
         QShortcut(QKeySequence(Qt.Key_Delete), self, activated=self.delete_selected)
 
-        self.resize(1200, 780)
-        self.refresh()
+        self.resize(1280, 800)
+        self.sync_panel()
 
     # --- panel izquierdo ---
 
     def _title(self, text):
         lab = QLabel(text)
-        lab.setStyleSheet("font-weight:600; font-size:13px; margin-top:10px;")
+        lab.setObjectName("title")
         return lab
 
     def _hint(self, text):
         lab = QLabel(text)
+        lab.setObjectName("hint")
         lab.setWordWrap(True)
-        lab.setStyleSheet("color:#64748b; font-size:11px;")
         return lab
 
     def _build_panel(self):
         panel = QWidget()
         panel.setObjectName("panel")
-        panel.setFixedWidth(270)
         v = QVBoxLayout(panel)
-        v.setContentsMargins(14, 10, 14, 14)
+        v.setContentsMargins(14, 8, 14, 14)
         v.setSpacing(6)
+
+        # Bastidor
+        v.addWidget(self._title("Bastidor (mm)"))
+        grid = QGridLayout()
+        self.hoop_w = QDoubleSpinBox()
+        self.hoop_h = QDoubleSpinBox()
+        for box, val in ((self.hoop_w, self.hoop[0]), (self.hoop_h, self.hoop[1])):
+            box.setRange(20, 600)
+            box.setSingleStep(5)
+            box.setDecimals(0)
+            box.setSuffix(" mm")
+            box.setValue(val)
+            box.valueChanged.connect(self.on_hoop)
+        grid.addWidget(QLabel("Ancho"), 0, 0)
+        grid.addWidget(self.hoop_w, 0, 1)
+        grid.addWidget(QLabel("Alto"), 1, 0)
+        grid.addWidget(self.hoop_h, 1, 1)
+        v.addLayout(grid)
+        v.addWidget(self._hint("Pon el tamaño del bastidor que vas a usar. "
+                               "El máximo es 380 × 260 mm."))
 
         # 1. Dibujar o mover
         v.addWidget(self._title("1. Dibuja o mueve"))
@@ -246,30 +393,22 @@ class MainWindow(QMainWindow):
         self.btn_select.clicked.connect(lambda: self.set_mode("select"))
         v.addWidget(self.btn_draw)
         v.addWidget(self.btn_select)
-        v.addWidget(self._hint("Haz clic para poner puntos. "
-                               "Doble clic o Enter para cerrar la forma."))
+        v.addWidget(self._hint("Clic para poner puntos. Doble clic o Enter para cerrar la forma."))
 
-        # 2. Ajustar la forma seleccionada
+        # 2. Ajustar la forma elegida
         v.addWidget(self._title("2. Ajusta la forma elegida"))
         self.sel_buttons = []
-        row = QHBoxLayout()
-        for text, fn in [("↺ Girar", lambda: self.rotate(-15)),
-                         ("↻ Girar", lambda: self.rotate(15))]:
-            b = QPushButton(text)
-            b.clicked.connect(fn)
-            row.addWidget(b)
-            self.sel_buttons.append(b)
-        v.addLayout(row)
-        row = QHBoxLayout()
-        for text, fn in [("－ Achicar", lambda: self.scale(0.9)),
-                         ("＋ Agrandar", lambda: self.scale(1.1))]:
-            b = QPushButton(text)
-            b.clicked.connect(fn)
-            row.addWidget(b)
-            self.sel_buttons.append(b)
-        v.addLayout(row)
+        for pair in ([("↺ Girar", -15, 0), ("↻ Girar", 15, 0)],
+                     [("－ Achicar", 0, 0.9), ("＋ Agrandar", 0, 1.1)]):
+            row = QHBoxLayout()
+            for text, deg, factor in pair:
+                b = QPushButton(text)
+                b.clicked.connect(lambda _=False, d=deg, f=factor: self.transform(d, f))
+                row.addWidget(b)
+                self.sel_buttons.append(b)
+            v.addLayout(row)
 
-        # 3. Puntadas
+        # 3. Cómo se borda
         v.addWidget(self._title("3. Cómo se borda"))
         self.kind_box = QComboBox()
         self.kind_box.addItems(["Relleno (llena la forma)", "Contorno (solo la línea)"])
@@ -280,12 +419,12 @@ class MainWindow(QMainWindow):
         self.angle_slider = QSlider(Qt.Horizontal)
         self.angle_slider.setRange(0, 179)
         self.angle_slider.setValue(45)
-        self.angle_slider.sliderPressed.connect(lambda: self.remember())
+        self.angle_slider.sliderPressed.connect(self.remember)
         self.angle_slider.valueChanged.connect(self.on_angle)
         v.addWidget(self.angle_label)
         v.addWidget(self.angle_slider)
 
-        self.spacing_label = QLabel("Separación entre líneas")
+        v.addWidget(QLabel("Separación entre líneas"))
         self.spacing_box = QDoubleSpinBox()
         self.spacing_box.setRange(0.25, 1.2)
         self.spacing_box.setSingleStep(0.05)
@@ -293,21 +432,49 @@ class MainWindow(QMainWindow):
         self.spacing_box.setSuffix(" mm")
         self.spacing_box.setValue(E.DEFAULT_SPACING_MM)
         self.spacing_box.valueChanged.connect(self.on_spacing)
-        v.addWidget(self.spacing_label)
         v.addWidget(self.spacing_box)
 
         v.addWidget(QLabel("Color"))
-        grid = QGridLayout()
+        swatches = QGridLayout()
         self.swatches = {}
         for i, (name, hexcol) in enumerate(COLORS.items()):
             b = QPushButton()
             b.setToolTip(name)
             b.setFixedHeight(30)
-            b.setStyleSheet(f"background:{hexcol}; border:2px solid #cbd5e1; border-radius:6px;")
             b.clicked.connect(lambda _=False, h=hexcol: self.set_color(h))
-            grid.addWidget(b, i // 4, i % 4)
+            swatches.addWidget(b, i // 4, i % 4)
             self.swatches[hexcol] = b
-        v.addLayout(grid)
+        v.addLayout(swatches)
+
+        # 4. Importar
+        v.addWidget(self._title("4. Importar"))
+        self.btn_import = QPushButton("🪄  Foto o vector → bordado")
+        self.btn_import.clicked.connect(self.import_file)
+        v.addWidget(self.btn_import)
+        v.addWidget(self._hint("Acepta .svg, .png o .jpg. Si tienes .ai o .pdf, "
+                               "ábrelos en Inkscape y guárdalos como SVG."))
+
+        # 5. Foto de fondo para calcar
+        v.addWidget(self._title("5. Foto de fondo para calcar"))
+        self.btn_bg = QPushButton("📷  Cargar foto de fondo")
+        self.btn_bg.clicked.connect(self.load_bg)
+        v.addWidget(self.btn_bg)
+        self.bg_opacity = QSlider(Qt.Horizontal)
+        self.bg_opacity.setRange(10, 100)
+        self.bg_opacity.valueChanged.connect(self.on_bg_opacity)
+        v.addWidget(QLabel("Transparencia de la foto"))
+        v.addWidget(self.bg_opacity)
+        self.bg_width = QDoubleSpinBox()
+        self.bg_width.setRange(10, 600)
+        self.bg_width.setDecimals(0)
+        self.bg_width.setSuffix(" mm")
+        self.bg_width.valueChanged.connect(self.on_bg_width)
+        v.addWidget(QLabel("Ancho de la foto"))
+        v.addWidget(self.bg_width)
+        self.bg_remove = QPushButton("Quitar foto")
+        self.bg_remove.clicked.connect(self.remove_bg)
+        v.addWidget(self.bg_remove)
+        v.addWidget(self._hint("Puedes arrastrar la foto sobre el bastidor."))
 
         # Acciones
         v.addWidget(self._title("Acciones"))
@@ -320,8 +487,6 @@ class MainWindow(QMainWindow):
         row.addWidget(self.btn_delete)
         v.addLayout(row)
 
-        v.addStretch(1)
-
         self.status = QLabel()
         self.status.setObjectName("status")
         self.status.setWordWrap(True)
@@ -331,9 +496,10 @@ class MainWindow(QMainWindow):
         save.setObjectName("save")
         save.clicked.connect(self.save)
         v.addWidget(save)
+        v.addStretch(1)
         return panel
 
-    # --- estado y acciones ---
+    # --- estado ---
 
     def selected_shape(self):
         i = self.canvas.selected
@@ -361,7 +527,7 @@ class MainWindow(QMainWindow):
             return
         self.shapes = self.history.pop()
         self.canvas.selected = -1
-        self.refresh()
+        self.sync_panel()
 
     def delete_selected(self):
         i = self.canvas.selected
@@ -370,7 +536,7 @@ class MainWindow(QMainWindow):
         self.remember()
         del self.shapes[i]
         self.canvas.selected = -1
-        self.refresh()
+        self.sync_panel()
 
     def set_mode(self, mode):
         self.canvas.mode = mode
@@ -379,27 +545,23 @@ class MainWindow(QMainWindow):
         self.btn_select.setChecked(mode == "select")
         self.canvas.update()
 
-    def rotate(self, deg):
+    def transform(self, deg, factor):
         sh = self.selected_shape()
         if sh is None:
             return
         self.remember()
-        sh.points = E.rotate_scale(sh.points, deg)
+        sh.transform(deg, factor if factor else 1.0)
         self.refresh()
 
-    def scale(self, factor):
-        sh = self.selected_shape()
-        if sh is None:
+    def on_hoop(self, _value=None):
+        if self._updating:
             return
-        self.remember()
-        sh.points = E.rotate_scale(sh.points, 0, factor)
+        self.hoop = [self.hoop_w.value(), self.hoop_h.value()]
         self.refresh()
 
     def on_kind(self, idx):
-        if self._updating:
-            return
         sh = self.selected_shape()
-        if sh is None:
+        if self._updating or sh is None:
             return
         self.remember()
         sh.kind = "fill" if idx == 0 else "run"
@@ -407,19 +569,15 @@ class MainWindow(QMainWindow):
 
     def on_angle(self, value):
         self.angle_label.setText(f"Dirección de las puntadas: {value}°")
-        if self._updating:
-            return
         sh = self.selected_shape()
-        if sh is None:
+        if self._updating or sh is None:
             return
         sh.fill_angle = float(value)
         self.refresh()
 
     def on_spacing(self, value):
-        if self._updating:
-            return
         sh = self.selected_shape()
-        if sh is None:
+        if self._updating or sh is None:
             return
         self.remember()
         sh.spacing = float(value)
@@ -433,8 +591,87 @@ class MainWindow(QMainWindow):
             sh.color = hexcol
         self.refresh()
 
+    # --- importar y fondo ---
+
+    def import_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Elegir foto o vector", "",
+            "Fotos y vectores (*.svg *.png *.jpg *.jpeg *.bmp *.webp)")
+        if not path:
+            return
+        hw, hh = self.hoop
+        width, ok = QInputDialog.getDouble(
+            self, "Tamaño del diseño", "Ancho del diseño (mm):",
+            round(min(hw, hh) * 0.8), 5, hw, 0)
+        if not ok:
+            return
+        photo = not path.lower().endswith(".svg")
+        try:
+            if photo:
+                n, ok = QInputDialog.getInt(self, "Colores",
+                                            "¿Cuántos colores tiene la foto? (2 a 8)",
+                                            4, 2, 8)
+                if not ok:
+                    return
+                shapes = E.photo_to_shapes(path, n, width)
+            else:
+                shapes = E.svg_to_shapes(path, width)
+        except Exception as ex:  # noqa: BLE001 - mostramos el error al usuario
+            QMessageBox.warning(self, "No se pudo importar", str(ex))
+            return
+        if not shapes:
+            QMessageBox.information(self, "Nada que importar",
+                                    "No encontré contornos en ese archivo.")
+            return
+        self.remember()
+        E.center_shapes(shapes, hw / 2, hh / 2)
+        self.shapes.extend(shapes)
+        self.canvas.selected = -1
+        self.sync_panel()
+        if photo:
+            QMessageBox.information(
+                self, "Listo",
+                "La foto quedó convertida en formas de color.\n"
+                "Revisa el resultado: el fondo también se borda. "
+                "Si no lo quieres, selecciónalo y bórralo.")
+
+    def load_bg(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Elegir foto de fondo", "",
+            "Imágenes (*.png *.jpg *.jpeg *.bmp *.webp)")
+        if not path:
+            return
+        img = QImage(path)
+        if img.isNull():
+            QMessageBox.warning(self, "No se pudo abrir", "No pude abrir esa imagen.")
+            return
+        hw, hh = self.hoop
+        ratio = img.height() / img.width()
+        w = min(hw * 0.9, hh * 0.9 / ratio)   # que quepa en el bastidor
+        self.bg = {"img": img, "x": (hw - w) / 2, "y": (hh - w * ratio) / 2,
+                   "w": w, "opacity": 0.5}
+        self.sync_panel()
+
+    def remove_bg(self):
+        self.bg = None
+        self.sync_panel()
+
+    def on_bg_opacity(self, value):
+        if self._updating or self.bg is None:
+            return
+        self.bg["opacity"] = value / 100
+        self.canvas.update()
+
+    def on_bg_width(self, value):
+        if self._updating or self.bg is None:
+            return
+        self.bg["w"] = float(value)
+        self.canvas.update()
+
+    # --- panel y estado ---
+
     def sync_panel(self):
-        """Pone los controles de acuerdo con la forma elegida."""
+        """Pone los controles de acuerdo con la forma elegida y la foto."""
         self._updating = True
         sh = self.selected_shape()
         has = sh is not None
@@ -449,6 +686,13 @@ class MainWindow(QMainWindow):
             self.angle_slider.setValue(int(sh.fill_angle) % 180)
             self.spacing_box.setValue(sh.spacing)
             self.current_color = sh.color
+
+        has_bg = self.bg is not None
+        for w in (self.bg_opacity, self.bg_width, self.bg_remove):
+            w.setEnabled(has_bg)
+        if has_bg:
+            self.bg_opacity.setValue(int(self.bg["opacity"] * 100))
+            self.bg_width.setValue(self.bg["w"])
         self._updating = False
         self.refresh()
 
@@ -457,26 +701,28 @@ class MainWindow(QMainWindow):
             border = "3px solid #0f172a" if hexcol == self.current_color else "2px solid #cbd5e1"
             b.setStyleSheet(f"background:{hexcol}; border:{border}; border-radius:6px;")
         self.btn_undo.setEnabled(bool(self.history))
-        _, info = E.build_pattern(self.shapes)
         if not self.shapes:
-            text = "Todavía no hay formas. Empieza dibujando una."
+            text = "Todavía no hay formas.\nDibuja una o importa una foto o vector."
         else:
+            info = E.analyze(self.shapes, self.hoop)
             cabe = "✔ cabe en el bastidor" if info["fits"] else "⚠ se sale del bastidor"
-            text = (f"Puntadas: {info['stitches']}\n"
-                    f"Tamaño: {info['width']:.0f} × {info['height']:.0f} mm\n{cabe}")
+            text = (f"Puntadas: {info['stitches']:,}\n"
+                    f"Diseño: {info['width']:.0f} × {info['height']:.0f} mm\n"
+                    f"Bastidor: {self.hoop[0]:g} × {self.hoop[1]:g} mm\n{cabe}")
         self.status.setText(text)
         self.canvas.update()
 
     def save(self):
         if not self.shapes:
-            QMessageBox.information(self, "Nada que guardar", "Dibuja al menos una forma primero.")
+            QMessageBox.information(self, "Nada que guardar",
+                                    "Dibuja o importa al menos una forma primero.")
             return
-        _, info = E.build_pattern(self.shapes)
+        info = E.analyze(self.shapes, self.hoop)
         if not info["fits"]:
             r = QMessageBox.question(
                 self, "Se sale del bastidor",
-                "El diseño es más grande que el bastidor de 380 × 260 mm.\n"
-                "¿Guardar igual?")
+                f"El diseño mide {info['width']:.0f} × {info['height']:.0f} mm y el "
+                f"bastidor es de {self.hoop[0]:g} × {self.hoop[1]:g} mm.\n¿Guardar igual?")
             if r != QMessageBox.Yes:
                 return
         path, _ = QFileDialog.getSaveFileName(self, "Guardar bordado", "bordado.dst",
@@ -485,8 +731,8 @@ class MainWindow(QMainWindow):
             return
         if not path.lower().endswith(".dst"):
             path += ".dst"
-        E.write_dst(self.shapes, path)
-        self.status.setText(self.status.text() + f"\n\n✔ Guardado: {path}")
+        E.write_dst(self.shapes, path, self.hoop)
+        self.statusBar().showMessage(f"Guardado: {path}", 8000)
 
 
 def main():

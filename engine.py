@@ -1,17 +1,89 @@
 """Motor del bordado: formas -> puntadas -> archivo .dst (Tajima).
 
-Todas las coordenadas están en milímetros. pyembroidery trabaja en
-décimas de milímetro, por eso al escribir se multiplica por 10.
+Coordenadas en milímetros. pyembroidery usa décimas de mm (se multiplica por 10).
+
+Una forma puede tener varios anillos (contornos). Se rellenan con regla
+par-impar: un anillo dentro de otro actúa como agujero (ej.: la letra "O").
+
+Las puntadas de cada forma se guardan en caché y solo se recalculan
+cuando cambia la forma, así que dibujar y mover va fluido.
 """
 import math
 
+import numpy as np
 import pyembroidery as pe
 
-HOOP_W_MM = 380.0        # bastidor más grande del usuario (38 cm)
-HOOP_H_MM = 260.0        # (26 cm)
-STITCH_MM = 3.0          # largo máximo de cada puntada
-DEFAULT_SPACING_MM = 0.4 # separación entre líneas de relleno
+STITCH_MM = 3.0           # largo máximo de cada puntada
+DEFAULT_SPACING_MM = 0.4  # separación entre líneas de relleno
+DEFAULT_HOOP = (380.0, 260.0)  # bastidor más grande (mm)
 
+
+# ---------- geometría ----------
+
+def rotate_scale(pts, angle_deg=0.0, scale=1.0, pivot=None):
+    """Gira y agranda puntos alrededor de un pivote."""
+    arr = np.asarray(pts, dtype=float)
+    cx, cy = pivot if pivot is not None else arr.mean(axis=0)
+    a = math.radians(angle_deg)
+    c, s = math.cos(a), math.sin(a)
+    dx = (arr[:, 0] - cx) * scale
+    dy = (arr[:, 1] - cy) * scale
+    return np.column_stack([cx + dx * c - dy * s, cy + dx * s + dy * c])
+
+
+def _as_rings(rings):
+    """Acepta un anillo (lista de puntos) o una lista de anillos."""
+    if isinstance(rings, np.ndarray) and rings.ndim == 2:
+        return [rings.astype(float)]
+    rings = list(rings)
+    if rings and np.ndim(rings[0]) == 1:
+        return [np.asarray(rings, dtype=float)]
+    return [np.asarray(r, dtype=float) for r in rings]
+
+
+def _subdivide(pts, step):
+    """Parte una línea en puntadas de largo máximo `step`."""
+    pts = np.asarray(pts, dtype=float)
+    out = [pts[:1]]
+    for a, b in zip(pts[:-1], pts[1:]):
+        length = math.hypot(b[0] - a[0], b[1] - a[1])
+        if length < 1e-9:
+            continue
+        n = max(1, math.ceil(length / step))
+        t = np.arange(1, n + 1)[:, None] / n
+        out.append(a + (b - a) * t)
+    return np.vstack(out)
+
+
+def _fill_lines(rings, angle, spacing, step):
+    """Líneas de relleno (en mm) con la dirección pedida, en serpentina."""
+    pivot = rings[0].mean(axis=0)
+    # Giramos la forma al revés para que las líneas queden horizontales.
+    flat = [rotate_scale(r, -angle, pivot=pivot) for r in rings]
+    seg = np.vstack([np.column_stack([r, np.roll(r, -1, axis=0)]) for r in flat])
+    x1, y1, x2, y2 = seg.T
+    lo = np.minimum(y1, y2)
+    hi = np.maximum(y1, y2)
+
+    lines = []
+    for k, y in enumerate(np.arange(lo.min() + spacing / 2, hi.max(), spacing)):
+        m = (lo <= y) & (y < hi)
+        if not m.any():
+            continue
+        xs = x1[m] + (y - y1[m]) * (x2[m] - x1[m]) / (y2[m] - y1[m])
+        xs.sort()
+        n = len(xs) // 2 * 2
+        left, right = xs[0:n:2], xs[1:n:2]
+        if k % 2:  # ida y vuelta: cada fila se recorre al revés
+            left, right = right[::-1], left[::-1]
+        for a, b in zip(left, right):
+            line = _subdivide(np.array([[a, y], [b, y]]), step)
+            if len(line) > 1:
+                lines.append(rotate_scale(line, angle, pivot=pivot))
+    return lines
+
+
+# ---------- forma ----------
 
 class Shape:
     """Una forma del bordado.
@@ -20,177 +92,260 @@ class Shape:
     fill_angle: dirección de las líneas de relleno, en grados.
     """
 
-    def __init__(self, points, kind="fill", color="#1e3a8a",
+    def __init__(self, rings, kind="fill", color="#1e3a8a",
                  fill_angle=45.0, spacing=DEFAULT_SPACING_MM):
-        self.points = [(float(x), float(y)) for x, y in points]
+        self.rings = _as_rings(rings)
         self.kind = kind
         self.color = color
         self.fill_angle = float(fill_angle)
         self.spacing = float(spacing)
+        self._key = None
+        self._lines = None
 
     def copy(self):
-        return Shape(self.points, self.kind, self.color,
+        return Shape([r.copy() for r in self.rings], self.kind, self.color,
                      self.fill_angle, self.spacing)
 
+    def is_valid(self):
+        return any(len(r) >= 3 for r in self.rings)
 
-# ---------- geometría ----------
+    def translate(self, dx, dy):
+        self.rings = [r + np.array([dx, dy]) for r in self.rings]
 
-def centroid(pts):
-    n = len(pts)
-    return (sum(x for x, _ in pts) / n, sum(y for _, y in pts) / n)
+    def transform(self, angle=0.0, scale=1.0):
+        """Gira y/o agranda la forma alrededor de su centro."""
+        pivot = self.rings[0].mean(axis=0)
+        self.rings = [rotate_scale(r, angle, scale, pivot) for r in self.rings]
 
+    def contains(self, x, y):
+        """¿El punto está dentro de la forma? (regla par-impar)"""
+        inside = False
+        for r in self.rings:
+            n = len(r)
+            for i in range(n):
+                x1, y1 = r[i]
+                x2, y2 = r[(i + 1) % n]
+                if (y1 > y) != (y2 > y) and x < (x2 - x1) * (y - y1) / (y2 - y1) + x1:
+                    inside = not inside
+        return inside
 
-def rotate_scale(pts, angle_deg=0.0, scale=1.0, pivot=None):
-    """Gira y agranda una lista de puntos alrededor de un pivote."""
-    cx, cy = pivot if pivot is not None else centroid(pts)
-    a = math.radians(angle_deg)
-    c, s = math.cos(a), math.sin(a)
-    out = []
-    for x, y in pts:
-        dx, dy = (x - cx) * scale, (y - cy) * scale
-        out.append((cx + dx * c - dy * s, cy + dx * s + dy * c))
-    return out
+    def polylines(self, stitch=STITCH_MM):
+        """Líneas de puntadas (mm). Se guardan en caché."""
+        key = (self.kind, self.fill_angle, self.spacing, stitch,
+               tuple(r.tobytes() for r in self.rings))
+        if key != self._key:
+            self._lines = self._compute(stitch)
+            self._key = key
+        return self._lines
 
-
-def translate(pts, dx, dy):
-    return [(x + dx, y + dy) for x, y in pts]
-
-
-def contains(pts, px, py):
-    """¿El punto (px, py) está dentro del polígono? (ray casting)"""
-    inside = False
-    j = len(pts) - 1
-    for i in range(len(pts)):
-        xi, yi = pts[i]
-        xj, yj = pts[j]
-        if (yi > py) != (yj > py):
-            x_cross = (xj - xi) * (py - yi) / (yj - yi) + xi
-            if px < x_cross:
-                inside = not inside
-        j = i
-    return inside
-
-
-def _dist(a, b):
-    return math.hypot(a[0] - b[0], a[1] - b[1])
+    def _compute(self, stitch):
+        if not self.is_valid():
+            return []
+        if self.kind == "run":
+            return [_subdivide(np.vstack([r, r[:1]]), stitch)
+                    for r in self.rings if len(r) >= 2]
+        return _fill_lines(self.rings, self.fill_angle, self.spacing, stitch)
 
 
-def _subdivide(poly, step):
-    """Parte una línea en puntadas de largo máximo `step`."""
-    out = [poly[0]]
-    for (x1, y1), (x2, y2) in zip(poly, poly[1:]):
-        length = math.hypot(x2 - x1, y2 - y1)
-        if length < 1e-6:
-            continue
-        n = max(1, math.ceil(length / step))
-        for i in range(1, n + 1):
-            t = i / n
-            out.append((x1 + (x2 - x1) * t, y1 + (y2 - y1) * t))
-    return out
+def bbox_of(shapes):
+    """(mínimo, máximo) de todas las formas válidas, o None."""
+    pts = [r for s in shapes if s.is_valid() for r in s.rings]
+    if not pts:
+        return None
+    allp = np.vstack(pts)
+    return allp.min(axis=0), allp.max(axis=0)
 
 
-# ---------- puntadas ----------
-
-def _fill_rows(pts, angle_deg, spacing):
-    """Segmentos horizontales de relleno, después girados al ángulo pedido.
-
-    Las filas van en "ida y vuelta" (serpentina) para que el hilo
-    no tenga que cruzar toda la forma de vuelta.
-    """
-    pivot = centroid(pts)
-    # Giramos la forma al revés para que las líneas queden horizontales.
-    flat = rotate_scale(pts, -angle_deg, pivot=pivot)
-    ys = [y for _, y in flat]
-    n = len(flat)
-    rows = []
-    y = min(ys) + spacing / 2
-    k = 0
-    while y < max(ys):
-        xs = []
-        for i in range(n):
-            (x1, y1), (x2, y2) = flat[i], flat[(i + 1) % n]
-            if (y1 <= y < y2) or (y2 <= y < y1):
-                xs.append(x1 + (y - y1) * (x2 - x1) / (y2 - y1))
-        xs.sort()
-        segs = [((xs[j], y), (xs[j + 1], y)) for j in range(0, len(xs) - 1, 2)]
-        if k % 2:
-            segs = [(b, a) for a, b in reversed(segs)]
-        rows.extend(segs)
-        y += spacing
-        k += 1
-    # Volvemos cada segmento a la orientación real de la forma.
-    return [rotate_scale(list(seg), angle_deg, pivot=pivot) for seg in rows]
-
-
-def shape_polylines(shape, stitch=STITCH_MM):
-    """Lista de líneas (en mm) que la máquina debe recorrer para esta forma."""
-    if shape.kind == "run":
-        loop = shape.points + [shape.points[0]]
-        return [_subdivide(loop, stitch)]
-    rows = _fill_rows(shape.points, shape.fill_angle, shape.spacing)
-    return [_subdivide(list(seg), stitch) for seg in rows]
+def center_shapes(shapes, cx, cy):
+    b = bbox_of(shapes)
+    if b is None:
+        return
+    mn, mx = b
+    d = np.array([cx, cy]) - (mn + mx) / 2
+    for s in shapes:
+        s.translate(d[0], d[1])
 
 
 # ---------- archivo ----------
 
-def _units(mm):
+def _u(mm):
     return int(round(mm * 10))
 
 
-def build_pattern(shapes, center=True, stitch=STITCH_MM):
-    """Convierte las formas en un patrón de pyembroidery.
-
-    Devuelve (patron, datos). `datos` trae cantidad de puntadas,
-    tamaño del diseño y si cabe en el bastidor.
-    """
+def _layers(shapes, stitch):
     layers = []
     for s in shapes:
-        if len(s.points) < 3:
+        if not s.is_valid():
             continue
-        lines = shape_polylines(s, stitch)
+        lines = s.polylines(stitch)
         if lines:
             layers.append((s.color, lines))
+    return layers
 
+
+def _placement(layers, hoop, center):
+    """Desplazamiento para centrar el diseño en el bastidor, y su tamaño."""
+    allp = np.vstack([line for _, lines in layers for line in lines])
+    mn, mx = allp.min(axis=0), allp.max(axis=0)
+    off = (np.array(hoop) / 2 - (mn + mx) / 2) if center else np.zeros(2)
+    return off, mx - mn
+
+
+def _ops(layers, off, stitch):
+    """Secuencia de comandos: ('C',) cambio de hilo, ('J'|'S', x, y)."""
+    cur = None
+    prev = None
+    for color, lines in layers:
+        if prev is not None and color != prev:
+            yield ("C", 0.0, 0.0)
+            cur = None
+        prev = color
+        for line in lines:
+            for i, (x, y) in enumerate((line + off).tolist()):
+                if i == 0 and (cur is None or math.hypot(x - cur[0], y - cur[1]) > stitch * 1.01):
+                    yield ("J", x, y)
+                else:
+                    yield ("S", x, y)
+                cur = (x, y)
+
+
+def _info(count, size, hoop):
+    w, h = float(size[0]), float(size[1])
+    return {"stitches": count, "width": w, "height": h,
+            "fits": w <= hoop[0] and h <= hoop[1]}
+
+
+def analyze(shapes, hoop=DEFAULT_HOOP, center=True, stitch=STITCH_MM):
+    """Cuenta puntadas y tamaño, sin generar el archivo (cuenta por línea, no por punto)."""
+    layers = _layers(shapes, stitch)
     if not layers:
-        return None, {"stitches": 0, "width": 0.0, "height": 0.0, "fits": True}
+        return _info(0, (0, 0), hoop)
+    off, size = _placement(layers, hoop, center)
+    count = 0
+    cur = None
+    for i, (color, lines) in enumerate(layers):
+        if i and color != layers[i - 1][0]:
+            cur = None                       # cambio de hilo: el siguiente salto cuenta
+        for line in lines:
+            first = line[0] + off
+            if cur is None or math.hypot(first[0] - cur[0], first[1] - cur[1]) > stitch * 1.01:
+                count += len(line) - 1       # el primer punto es un salto, no puntada
+            else:
+                count += len(line)
+            cur = line[-1] + off
+    return _info(count, size, hoop)
 
-    all_pts = [p for _, lines in layers for line in lines for p in line]
-    xs = [x for x, _ in all_pts]
-    ys = [y for _, y in all_pts]
-    minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
-    width, height = maxx - minx, maxy - miny
 
-    dx = HOOP_W_MM / 2 - (minx + maxx) / 2 if center else 0.0
-    dy = HOOP_H_MM / 2 - (miny + maxy) / 2 if center else 0.0
-
+def build_pattern(shapes, hoop=DEFAULT_HOOP, center=True, stitch=STITCH_MM):
+    """Convierte las formas en un patrón de pyembroidery. Devuelve (patron, datos)."""
+    layers = _layers(shapes, stitch)
+    if not layers:
+        return None, _info(0, (0, 0), hoop)
+    off, size = _placement(layers, hoop, center)
     pat = pe.EmbPattern()
     count = 0
-    prev_color = None
-    cur = None
-    for color, lines in layers:
-        if prev_color is not None and color != prev_color:
+    for kind, x, y in _ops(layers, off, stitch):
+        if kind == "C":
             pat.add_command(pe.COLOR_CHANGE)   # la máquina pide cambiar de hilo
-            cur = None
-        prev_color = color
-        for line in lines:
-            for i, (x, y) in enumerate(line):
-                x, y = x + dx, y + dy
-                close = cur is not None and _dist(cur, (x, y)) <= stitch * 1.01
-                if i == 0 and not close:
-                    pat.add_stitch_absolute(pe.JUMP, _units(x), _units(y))
-                else:
-                    pat.add_stitch_absolute(pe.STITCH, _units(x), _units(y))
-                    count += 1
-                cur = (x, y)
+        elif kind == "J":
+            pat.add_stitch_absolute(pe.JUMP, _u(x), _u(y))
+        else:
+            pat.add_stitch_absolute(pe.STITCH, _u(x), _u(y))
+            count += 1
     pat.add_command(pe.END)
-
-    fits = width <= HOOP_W_MM and height <= HOOP_H_MM
-    return pat, {"stitches": count, "width": width, "height": height, "fits": fits}
+    return pat, _info(count, size, hoop)
 
 
-def write_dst(shapes, path, center=True):
-    pat, info = build_pattern(shapes, center=center)
+def write_dst(shapes, path, hoop=DEFAULT_HOOP, center=True):
+    pat, info = build_pattern(shapes, hoop, center)
     if pat is None:
         raise ValueError("No hay formas para guardar.")
     pe.write_dst(pat, path)
     return info
+
+
+# ---------- importar ----------
+
+def photo_to_shapes(path, n_colors=4, width_mm=150.0, min_area_mm2=2.0):
+    """Foto -> formas de relleno, una por color. Es una aproximación: revísala."""
+    import cv2
+
+    data = np.fromfile(path, dtype=np.uint8)   # funciona con rutas con tildes
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("No pude abrir la imagen.")
+    h, w = img.shape[:2]
+    if max(h, w) > 500:
+        f = 500 / max(h, w)
+        img = cv2.resize(img, (round(w * f), round(h * f)), interpolation=cv2.INTER_AREA)
+    img = cv2.medianBlur(img, 5)
+
+    pix = img.reshape(-1, 3).astype(np.float32)
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    _, labels, centers = cv2.kmeans(pix, n_colors, None, crit, 3, cv2.KMEANS_PP_CENTERS)
+    labels = labels.reshape(img.shape[:2])
+    counts = np.bincount(labels.ravel(), minlength=n_colors)
+    mm_px = width_mm / img.shape[1]
+
+    shapes = []
+    for k in np.argsort(-counts):          # las áreas grandes primero
+        if counts[k] == 0:
+            continue
+        mask = np.zeros((img.shape[0] + 2, img.shape[1] + 2), np.uint8)
+        mask[1:-1, 1:-1] = np.where(labels == k, 255, 0)
+        contours, _ = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        rings = []
+        for c in contours:
+            c = cv2.approxPolyDP(c, 1.0, True).reshape(-1, 2).astype(float) - 1
+            if len(c) < 3:
+                continue
+            area = abs(cv2.contourArea(c.astype(np.float32))) * mm_px ** 2
+            if area < min_area_mm2:
+                continue
+            rings.append(c * mm_px)
+        if rings:
+            b, g, r = centers[k]
+            color = "#%02x%02x%02x" % (int(r), int(g), int(b))
+            shapes.append(Shape(rings, "fill", color))
+    return shapes
+
+
+def svg_to_shapes(path, width_mm=150.0):
+    """Vector SVG -> formas. Lo relleno se borda como relleno; lo que solo tiene borde, como contorno."""
+    import svgelements as se
+
+    svg = se.SVG.parse(path)
+    items = []
+    for el in svg.elements():
+        if not isinstance(el, se.Shape):
+            continue
+        p = se.Path(el)
+        fill = getattr(el.fill, "hex", None)
+        stroke = getattr(el.stroke, "hex", None)
+        rings = []
+        for sub in p.as_subpaths():
+            sp = se.Path(sub)
+            n = max(12, min(400, 8 * len(sp)))
+            pts = np.asarray(sp.npoint(np.linspace(0, 1, n)), dtype=float)  # columnas x, y
+            if len(pts) >= 3:
+                rings.append(pts)
+        if not rings:
+            continue
+        if fill:
+            items.append(("fill", fill, rings))
+        elif stroke:
+            items.append(("run", stroke, rings))
+        else:
+            items.append(("fill", "#111827", rings))
+
+    if not items:
+        return []
+    allp = np.vstack([r for _, _, rings in items for r in rings])
+    mn, mx = allp.min(axis=0), allp.max(axis=0)
+    span = max(mx[0] - mn[0], 1e-9)
+    scale = width_mm / span
+    shapes = []
+    for kind, color, rings in items:
+        scaled = [(r - mn) * scale for r in rings]
+        shapes.append(Shape(scaled, kind, color))
+    return shapes
