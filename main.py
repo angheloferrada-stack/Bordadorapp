@@ -14,7 +14,7 @@ from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter,
                            QPainterPath, QPen, QPolygonF, QShortcut)
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMessageBox, QPushButton,
     QScrollArea, QSlider, QVBoxLayout, QWidget,
 )
@@ -382,7 +382,31 @@ class MainWindow(QMainWindow):
         v.setContentsMargins(14, 8, 14, 14)
         v.setSpacing(6)
 
-        # Bastidor
+        # Tamaño del diseño: lo que vas a bordar
+        v.addWidget(self._title("Tamaño del diseño (mm)"))
+        dgrid = QGridLayout()
+        self.design_w = QDoubleSpinBox()
+        self.design_h = QDoubleSpinBox()
+        for box in (self.design_w, self.design_h):
+            box.setRange(1, 600)
+            box.setSingleStep(5)
+            box.setDecimals(0)
+            box.setSuffix(" mm")
+            box.setValue(100)
+        self.design_w.valueChanged.connect(lambda _v: self.on_design("w"))
+        self.design_h.valueChanged.connect(lambda _v: self.on_design("h"))
+        dgrid.addWidget(QLabel("Ancho"), 0, 0)
+        dgrid.addWidget(self.design_w, 0, 1)
+        dgrid.addWidget(QLabel("Alto"), 1, 0)
+        dgrid.addWidget(self.design_h, 1, 1)
+        v.addLayout(dgrid)
+        self.keep_ratio = QCheckBox("Mantener proporción")
+        self.keep_ratio.setChecked(True)
+        v.addWidget(self.keep_ratio)
+        v.addWidget(self._hint("Pon el tamaño que quieres bordar y el diseño se ajusta. "
+                               "El bastidor de abajo es el máximo: el diseño tiene que caber."))
+
+        # Bastidor: el máximo que tienes
         v.addWidget(self._title("Bastidor (mm)"))
         grid = QGridLayout()
         self.hoop_w = QDoubleSpinBox()
@@ -612,6 +636,25 @@ class MainWindow(QMainWindow):
         self.hoop = [self.hoop_w.value(), self.hoop_h.value()]
         self.refresh()
 
+    def on_design(self, which):
+        """El usuario cambió el tamaño del diseño: escalamos todo."""
+        if self._updating or not self.shapes:
+            return
+        b = E.bbox_of(self.shapes)
+        if b is None:
+            return
+        mn, mx = b
+        w, h = mx[0] - mn[0], mx[1] - mn[1]
+        nw, nh = self.design_w.value(), self.design_h.value()
+        if self.keep_ratio.isChecked() and w > 1e-9 and h > 1e-9:
+            if which == "w":
+                nh = nw * h / w
+            else:
+                nw = nh * w / h
+        self.remember()
+        E.resize_shapes(self.shapes, nw, nh)
+        self.refresh()
+
     def on_kind(self, idx):
         sh = self.selected_shape()
         if self._updating or sh is None:
@@ -767,6 +810,19 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def refresh(self):
+        # Mostrar el tamaño actual del diseño (sin volver a escalar).
+        old = self._updating
+        self._updating = True
+        b = E.bbox_of(self.shapes)
+        has = b is not None
+        self.design_w.setEnabled(has)
+        self.design_h.setEnabled(has)
+        self.keep_ratio.setEnabled(has)
+        if has:
+            mn, mx = b
+            self.design_w.setValue(float(mx[0] - mn[0]))
+            self.design_h.setValue(float(mx[1] - mn[1]))
+        self._updating = old
         for hexcol, b in self.swatches.items():
             border = "3px solid #0f172a" if hexcol == self.current_color else "2px solid #cbd5e1"
             b.setStyleSheet(f"background:{hexcol}; border:{border}; border-radius:6px;")

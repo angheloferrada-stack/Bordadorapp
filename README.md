@@ -12,7 +12,8 @@ Pensado para hacerlo fácil: pones el tamaño del bastidor, dibujas o importas l
 
 ## Cómo usarlo
 
-1. **Bastidor:** arriba del panel pon el ancho y alto del bastidor que vas a usar (en mm). El máximo es 380 × 260.
+1. **Tamaño del diseño:** arriba del panel pon el ancho y alto que quieres bordar (en mm). La app escala todo el diseño a esa medida. Con "Mantener proporción" activado, al cambiar un lado el otro se ajusta solo.
+   **Bastidor:** más abajo pones el tamaño del bastidor que vas a usar. Es el máximo: si el diseño no cabe, la app avisa antes de guardar. El bastidor más grande es 380 × 260.
 2. **Dibuja:** haz clic en cada punto de la forma. Doble clic (o Enter) para cerrarla.
 3. **Importa** (opcional): botón "Foto o vector → bordado".
    - `.svg`: cada figura se borda con su color. Las letras con agujeros quedan bien.

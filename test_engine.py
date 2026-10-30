@@ -201,5 +201,17 @@ class SatinTests(unittest.TestCase):
         self.assertGreater(sat.width, 1.0)   # trazo de 4 px escalado
 
 
+class ResizeTests(unittest.TestCase):
+    def test_resize_sets_exact_size_and_keeps_center(self):
+        shapes = [E.Shape(square(0, 0, 50)), E.Shape([(20, 20), (60, 20)], kind="satin", width=3)]
+        before = E.bbox_of(shapes)
+        c_before = (before[0] + before[1]) / 2
+        E.resize_shapes(shapes, 120, 40)
+        mn, mx = E.bbox_of(shapes)
+        self.assertAlmostEqual(mx[0] - mn[0], 120, delta=1e-2)   # el satén cuenta en el tamaño
+        self.assertAlmostEqual(mx[1] - mn[1], 40, delta=1e-2)
+        self.assertTrue(np.allclose((mn + mx) / 2, c_before, atol=1.0))  # corrimiento leve por el satén
+
+
 if __name__ == "__main__":
     unittest.main()

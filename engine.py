@@ -204,6 +204,28 @@ def bbox_of(shapes):
     return np.min(mins, axis=0), np.max(maxs, axis=0)
 
 
+def resize_shapes(shapes, new_w, new_h):
+    """Escala todo el diseño para que mida new_w x new_h mm (satén incluido), manteniendo su centro.
+
+    El satén agrega su ancho a los bordes, así que se repite el ajuste hasta acertar.
+    """
+    for _ in range(8):
+        b = bbox_of(shapes)
+        if b is None:
+            return
+        mn, mx = b
+        w, h = mx[0] - mn[0], mx[1] - mn[1]
+        if abs(w - new_w) < 1e-3 and abs(h - new_h) < 1e-3:
+            break
+        sx = new_w / w if w > 1e-9 else 1.0
+        sy = new_h / h if h > 1e-9 else 1.0
+        c = (mn + mx) / 2
+        for s in shapes:
+            s.rings = [(r - c) * np.array([sx, sy]) + c for r in s.rings]
+            if s.kind == "satin":
+                s.width *= min(sx, sy)
+
+
 def center_shapes(shapes, cx, cy):
     b = bbox_of(shapes)
     if b is None:
