@@ -23,6 +23,7 @@ Pensado para hacerlo fácil: pones el tamaño del bastidor, dibujas o importas l
 6. **Cómo se borda:**
    - *Relleno*: llena la forma. La dirección de las puntadas se cambia con el slider.
    - *Contorno*: solo recorre el borde.
+   - *Satén*: bordado de ancho fijo, para letras y líneas gruesas. Dibuja una línea con "Dibujar línea de satén" y elige su ancho en mm (3 a 5 mm es lo normal). Si importas un SVG, las líneas abiertas con borde grueso también quedan en satén.
    - Elige el color con los cuadraditos.
 7. **Guarda:** botón verde "Guardar bordado (.dst)". Pasa el archivo a la bordadora por USB.
 
@@ -31,8 +32,8 @@ Atajos: Ctrl+Z deshacer, Ctrl+S guardar, Supr borrar la forma elegida.
 
 ## Qué todavía no tiene
 
-- Puntadas de satén (para letras y líneas gruesas).
 - Abrir .dst que ya existen.
+- Satén con esquinas muy cerradas: en ángulos agudos las columnas se cruzan. Conviene dividir la línea en tramos.
 
 ## Para desarrolladores
 

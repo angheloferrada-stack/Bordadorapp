@@ -16,6 +16,8 @@ import pyembroidery as pe
 STITCH_MM = 3.0           # largo máximo de cada puntada
 DEFAULT_SPACING_MM = 0.4  # separación entre líneas de relleno
 DEFAULT_HOOP = (380.0, 260.0)  # bastidor más grande (mm)
+DEFAULT_SATIN_WIDTH_MM = 3.0   # ancho por defecto de una línea de satén
+SATIN_DENSITY_MM = 0.4         # distancia entre columnas de zigzag del satén
 
 
 # ---------- geometría ----------
@@ -83,30 +85,58 @@ def _fill_lines(rings, angle, spacing, step):
     return lines
 
 
+def _satin_line(center, width, density=SATIN_DENSITY_MM, step=STITCH_MM):
+    """Zigzag de satén a lo largo de una línea, de borde a borde."""
+    c = np.asarray(center, dtype=float)
+    d = np.hypot(*np.diff(c, axis=0).T)
+    c = c[np.concatenate([[True], d > 1e-9])]
+    if len(c) < 2:
+        return np.zeros((0, 2))
+    d = np.hypot(*np.diff(c, axis=0).T)
+    cum = np.concatenate([[0.0], np.cumsum(d)])
+    n = max(1, math.ceil(cum[-1] / density))
+    t = np.linspace(0.0, cum[-1], n + 1)
+    pts = np.column_stack([np.interp(t, cum, c[:, 0]), np.interp(t, cum, c[:, 1])])
+    tan = np.gradient(pts, axis=0)
+    norm = np.hypot(tan[:, 0], tan[:, 1])
+    norm[norm == 0] = 1.0
+    tan = tan / norm[:, None]
+    nrm = np.column_stack([-tan[:, 1], tan[:, 0]]) * (width / 2)
+    zig = np.empty((2 * len(pts), 2))
+    zig[0::2] = pts + nrm       # un lado
+    zig[1::2] = pts - nrm       # el otro lado
+    return _subdivide(zig, step)
+
+
 # ---------- forma ----------
 
 class Shape:
     """Una forma del bordado.
 
-    kind: "fill" (relleno, llena la forma) o "run" (contorno, una línea).
+    kind: "fill" (relleno, llena la forma), "run" (contorno, una línea)
+          o "satin" (satén: una línea gruesa de `width` mm).
     fill_angle: dirección de las líneas de relleno, en grados.
     """
 
     def __init__(self, rings, kind="fill", color="#1e3a8a",
-                 fill_angle=45.0, spacing=DEFAULT_SPACING_MM):
+                 fill_angle=45.0, spacing=DEFAULT_SPACING_MM,
+                 width=DEFAULT_SATIN_WIDTH_MM):
         self.rings = _as_rings(rings)
         self.kind = kind
         self.color = color
         self.fill_angle = float(fill_angle)
         self.spacing = float(spacing)
+        self.width = float(width)
         self._key = None
         self._lines = None
 
     def copy(self):
         return Shape([r.copy() for r in self.rings], self.kind, self.color,
-                     self.fill_angle, self.spacing)
+                     self.fill_angle, self.spacing, self.width)
 
     def is_valid(self):
+        if self.kind == "satin":
+            return len(self.rings) > 0 and len(self.rings[0]) >= 2
         return any(len(r) >= 3 for r in self.rings)
 
     def translate(self, dx, dy):
@@ -116,9 +146,19 @@ class Shape:
         """Gira y/o agranda la forma alrededor de su centro."""
         pivot = self.rings[0].mean(axis=0)
         self.rings = [rotate_scale(r, angle, scale, pivot) for r in self.rings]
+        self.width *= scale
 
     def contains(self, x, y):
-        """¿El punto está dentro de la forma? (regla par-impar)"""
+        """¿El punto está dentro de la forma? (regla par-impar; en satén, cerca de la línea)"""
+        if self.kind == "satin":
+            c = self.rings[0]
+            a, b = c[:-1], c[1:]
+            ab = b - a
+            den = np.maximum((ab ** 2).sum(axis=1), 1e-12)
+            t = np.clip(((np.array([x, y]) - a) * ab).sum(axis=1) / den, 0.0, 1.0)
+            proj = a + ab * t[:, None]
+            dist = np.hypot(proj[:, 0] - x, proj[:, 1] - y).min()
+            return dist <= max(self.width / 2, 1.5)
         inside = False
         for r in self.rings:
             n = len(r)
@@ -131,7 +171,7 @@ class Shape:
 
     def polylines(self, stitch=STITCH_MM):
         """Líneas de puntadas (mm). Se guardan en caché."""
-        key = (self.kind, self.fill_angle, self.spacing, stitch,
+        key = (self.kind, self.fill_angle, self.spacing, self.width, stitch,
                tuple(r.tobytes() for r in self.rings))
         if key != self._key:
             self._lines = self._compute(stitch)
@@ -144,16 +184,24 @@ class Shape:
         if self.kind == "run":
             return [_subdivide(np.vstack([r, r[:1]]), stitch)
                     for r in self.rings if len(r) >= 2]
+        if self.kind == "satin":
+            line = _satin_line(self.rings[0], self.width, SATIN_DENSITY_MM, stitch)
+            return [line] if len(line) > 1 else []
         return _fill_lines(self.rings, self.fill_angle, self.spacing, stitch)
 
 
 def bbox_of(shapes):
     """(mínimo, máximo) de todas las formas válidas, o None."""
-    pts = [r for s in shapes if s.is_valid() for r in s.rings]
-    if not pts:
+    valid = [s for s in shapes if s.is_valid()]
+    if not valid:
         return None
-    allp = np.vstack(pts)
-    return allp.min(axis=0), allp.max(axis=0)
+    mins, maxs = [], []
+    for s in valid:
+        pad = s.width / 2 if s.kind == "satin" else 0.0
+        allp = np.vstack(s.rings)
+        mins.append(allp.min(axis=0) - pad)
+        maxs.append(allp.max(axis=0) + pad)
+    return np.min(mins, axis=0), np.max(maxs, axis=0)
 
 
 def center_shapes(shapes, cx, cy):
@@ -311,41 +359,56 @@ def photo_to_shapes(path, n_colors=4, width_mm=150.0, min_area_mm2=2.0):
 
 
 def svg_to_shapes(path, width_mm=150.0):
-    """Vector SVG -> formas. Lo relleno se borda como relleno; lo que solo tiene borde, como contorno."""
+    """Vector SVG -> formas.
+
+    - Figuras rellenas: relleno (las letras con agujeros quedan bien).
+    - Líneas abiertas con borde: satén, con el grosor del trazo.
+    - Contornos cerrados con solo borde: contorno.
+    """
     import svgelements as se
 
     svg = se.SVG.parse(path)
-    items = []
+    items = []   # (tipo, color, anillos, grosor del trazo o None)
     for el in svg.elements():
         if not isinstance(el, se.Shape):
             continue
         p = se.Path(el)
         fill = getattr(el.fill, "hex", None)
         stroke = getattr(el.stroke, "hex", None)
+        sw = el.stroke_width if el.stroke_width else 1.0
         rings = []
         for sub in p.as_subpaths():
             sp = se.Path(sub)
             n = max(12, min(400, 8 * len(sp)))
-            pts = np.asarray(sp.npoint(np.linspace(0, 1, n)), dtype=float)  # columnas x, y
-            if len(pts) >= 3:
+            pts = np.asarray(sp.npoint(np.linspace(0, 1, n)), dtype=float)
+            if len(pts) >= 2:
                 rings.append(pts)
         if not rings:
             continue
         if fill:
-            items.append(("fill", fill, rings))
+            items.append(("fill", fill, [r for r in rings if len(r) >= 3], None))
         elif stroke:
-            items.append(("run", stroke, rings))
+            for r in rings:
+                closed = np.hypot(*(r[0] - r[-1])) < 1e-6
+                if closed:
+                    items.append(("run", stroke, [r], None))
+                else:
+                    items.append(("satin", stroke, [r], float(sw)))
         else:
-            items.append(("fill", "#111827", rings))
+            items.append(("fill", "#111827", [r for r in rings if len(r) >= 3], None))
 
+    items = [it for it in items if it[2]]
     if not items:
         return []
-    allp = np.vstack([r for _, _, rings in items for r in rings])
+    allp = np.vstack([r for _, _, rings, _ in items for r in rings])
     mn, mx = allp.min(axis=0), allp.max(axis=0)
     span = max(mx[0] - mn[0], 1e-9)
     scale = width_mm / span
     shapes = []
-    for kind, color, rings in items:
+    for kind, color, rings, sw in items:
         scaled = [(r - mn) * scale for r in rings]
-        shapes.append(Shape(scaled, kind, color))
+        if kind == "satin":
+            shapes.append(Shape(scaled, "satin", color, width=max(0.5, sw * scale)))
+        else:
+            shapes.append(Shape(scaled, kind, color))
     return shapes

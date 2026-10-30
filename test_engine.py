@@ -152,5 +152,54 @@ class ImportTests(unittest.TestCase):
         self.assertAlmostEqual(b[1][0] - b[0][0], 160, delta=2)
 
 
+class SatinTests(unittest.TestCase):
+    def test_satin_zigzag_width_and_density(self):
+        line = [(0, 0), (60, 0)]           # línea de 60 mm
+        s = E.Shape(line, kind="satin", width=4)
+        pts = s.polylines()[0]
+        # Los puntos de cada lado quedan a 2 mm de la línea.
+        self.assertAlmostEqual(np.abs(pts[:, 1]).max(), 2, delta=0.05)
+        # Ninguna puntada pasa de 3 mm.
+        steps = np.hypot(*np.diff(pts, axis=0).T)
+        self.assertLessEqual(steps.max(), E.STITCH_MM + 1e-6)
+        # Hay del orden de 60/0.4 columnas.
+        self.assertGreater(len(pts), 250)
+
+    def test_satin_hit_test_is_near_line(self):
+        s = E.Shape([(0, 0), (60, 0)], kind="satin", width=4)
+        self.assertTrue(s.contains(30, 1))
+        self.assertFalse(s.contains(30, 10))
+
+    def test_satin_scales_width_too(self):
+        s = E.Shape([(0, 0), (60, 0)], kind="satin", width=4)
+        s.transform(0, 2)
+        self.assertAlmostEqual(s.width, 8)
+
+    def test_satin_writes_file(self):
+        shapes = [E.Shape([(10, 10), (70, 12), (120, 10)], kind="satin", width=3,
+                          color="#15803d")]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.dst")
+            info = E.write_dst(shapes, path)
+            self.assertGreater(info["stitches"], 100)
+            self.assertGreater(os.path.getsize(path), 512)
+
+    def test_svg_open_stroke_becomes_satin(self):
+        svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">'
+               '<path d="M10 50 L90 50" stroke="#000000" stroke-width="4" fill="none"/>'
+               '<path d="M10 10 L30 10 L30 30 L10 30 Z" stroke="#ff0000" stroke-width="1" fill="none"/>'
+               '</svg>')
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "l.svg")
+            with open(path, "w") as f:
+                f.write(svg)
+            shapes = E.svg_to_shapes(path, width_mm=160)
+        kinds = [s.kind for s in shapes]
+        self.assertIn("satin", kinds)
+        self.assertIn("run", kinds)          # el cuadrado cerrado queda como contorno
+        sat = [s for s in shapes if s.kind == "satin"][0]
+        self.assertGreater(sat.width, 1.0)   # trazo de 4 px escalado
+
+
 if __name__ == "__main__":
     unittest.main()

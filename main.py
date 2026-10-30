@@ -66,7 +66,7 @@ class Canvas(QWidget):
     def __init__(self, win):
         super().__init__()
         self.win = win
-        self.mode = "draw"        # "draw" o "select"
+        self.mode = "draw_fill"   # "draw_fill", "draw_satin" o "select"
         self.in_progress = []     # puntos de la forma que se está dibujando
         self.selected = -1
         self._drag = None         # (tipo, inicio, valor original, historial)
@@ -144,10 +144,20 @@ class Canvas(QWidget):
                 if len(r) >= 3:
                     path.addPolygon(self._poly(r, v))
                     path.closeSubpath()
-            p.setBrush(QColor(col.red(), col.green(), col.blue(), 45)
-                       if sh.kind == "fill" else Qt.NoBrush)
-            p.setPen(QPen(col, 1.5))
-            p.drawPath(path)
+            if sh.kind == "satin":
+                # La banda muestra el ancho real del satén (en píxeles).
+                band = QColor(col.red(), col.green(), col.blue(), 55)
+                p.setBrush(Qt.NoBrush)
+                p.setPen(QPen(band, max(2.0, sh.width * s), Qt.SolidLine,
+                              Qt.RoundCap, Qt.RoundJoin))
+                p.drawPolyline(self._poly(sh.rings[0], v))
+                p.setPen(QPen(col, 1))
+                p.drawPolyline(self._poly(sh.rings[0], v))
+            else:
+                p.setBrush(QColor(col.red(), col.green(), col.blue(), 45)
+                           if sh.kind == "fill" else Qt.NoBrush)
+                p.setPen(QPen(col, 1.5))
+                p.drawPath(path)
 
             # Vista previa de las puntadas (no se dibuja mientras la mueves).
             if i != self._dragged:
@@ -233,8 +243,9 @@ class Canvas(QWidget):
         if e.button() != Qt.LeftButton:
             return
         x, y = self.to_mm(e.position())
-        if self.mode == "draw":
-            if len(self.in_progress) >= 3 and _dist(self.in_progress[0], (x, y)) < 2.5:
+        if self.mode.startswith("draw"):
+            if (self.mode == "draw_fill" and len(self.in_progress) >= 3
+                    and _dist(self.in_progress[0], (x, y)) < 2.5):
                 self.finish_shape()
                 return
             if not self.in_progress or _dist(self.in_progress[-1], (x, y)) > 0.5:
@@ -286,8 +297,11 @@ class Canvas(QWidget):
         self.win.refresh()
 
     def mouseDoubleClickEvent(self, e):
-        if self.mode == "draw" and len(self.in_progress) >= 3:
+        if self.mode.startswith("draw") and len(self.in_progress) >= self._min_points():
             self.finish_shape()
+
+    def _min_points(self):
+        return 2 if self.mode == "draw_satin" else 3
 
     def keyPressEvent(self, e):
         if e.key() in (Qt.Key_Return, Qt.Key_Enter):
@@ -299,9 +313,14 @@ class Canvas(QWidget):
             super().keyPressEvent(e)
 
     def finish_shape(self):
-        if len(self.in_progress) < 3:
+        if len(self.in_progress) < self._min_points():
             return
-        self.win.add_shape(E.Shape(np.array(self.in_progress, dtype=float)))
+        pts = np.array(self.in_progress, dtype=float)
+        if self.mode == "draw_satin":
+            shape = E.Shape(pts, "satin", width=self.win.satin_width)
+        else:
+            shape = E.Shape(pts, "fill")
+        self.win.add_shape(shape)
         self.in_progress = []
         self.selected = len(self.win.shapes) - 1
         self.win.sync_panel()
@@ -315,6 +334,7 @@ class MainWindow(QMainWindow):
         self.shapes = []
         self.history = []
         self.hoop = list(E.DEFAULT_HOOP)   # (ancho, alto) en mm
+        self.satin_width = E.DEFAULT_SATIN_WIDTH_MM
         self.bg = None                     # foto de fondo para calcar
         self.current_color = COLORS["Azul"]
         self._updating = False
@@ -387,13 +407,18 @@ class MainWindow(QMainWindow):
         self.btn_draw = QPushButton("✏  Dibujar forma")
         self.btn_draw.setCheckable(True)
         self.btn_draw.setChecked(True)
-        self.btn_draw.clicked.connect(lambda: self.set_mode("draw"))
+        self.btn_draw.clicked.connect(lambda: self.set_mode("draw_fill"))
+        self.btn_satin = QPushButton("〰  Dibujar línea de satén")
+        self.btn_satin.setCheckable(True)
+        self.btn_satin.clicked.connect(lambda: self.set_mode("draw_satin"))
         self.btn_select = QPushButton("✋  Mover / elegir")
         self.btn_select.setCheckable(True)
         self.btn_select.clicked.connect(lambda: self.set_mode("select"))
         v.addWidget(self.btn_draw)
+        v.addWidget(self.btn_satin)
         v.addWidget(self.btn_select)
-        v.addWidget(self._hint("Clic para poner puntos. Doble clic o Enter para cerrar la forma."))
+        v.addWidget(self._hint("Forma: clic en cada punto; doble clic o Enter para cerrarla. "
+                               "Satén: clic en la línea; doble clic o Enter para terminar."))
 
         # 2. Ajustar la forma elegida
         v.addWidget(self._title("2. Ajusta la forma elegida"))
@@ -411,20 +436,26 @@ class MainWindow(QMainWindow):
         # 3. Cómo se borda
         v.addWidget(self._title("3. Cómo se borda"))
         self.kind_box = QComboBox()
-        self.kind_box.addItems(["Relleno (llena la forma)", "Contorno (solo la línea)"])
+        self.kind_box.addItems(["Relleno (llena la forma)",
+                                "Contorno (solo la línea)",
+                                "Satén (línea gruesa)"])
         self.kind_box.currentIndexChanged.connect(self.on_kind)
         v.addWidget(self.kind_box)
 
+        # Grupo del relleno: dirección y separación
+        self.fill_box = QWidget()
+        fb = QVBoxLayout(self.fill_box)
+        fb.setContentsMargins(0, 0, 0, 0)
+        fb.setSpacing(6)
         self.angle_label = QLabel("Dirección de las puntadas: 45°")
         self.angle_slider = QSlider(Qt.Horizontal)
         self.angle_slider.setRange(0, 179)
         self.angle_slider.setValue(45)
         self.angle_slider.sliderPressed.connect(self.remember)
         self.angle_slider.valueChanged.connect(self.on_angle)
-        v.addWidget(self.angle_label)
-        v.addWidget(self.angle_slider)
-
-        v.addWidget(QLabel("Separación entre líneas"))
+        fb.addWidget(self.angle_label)
+        fb.addWidget(self.angle_slider)
+        fb.addWidget(QLabel("Separación entre líneas"))
         self.spacing_box = QDoubleSpinBox()
         self.spacing_box.setRange(0.25, 1.2)
         self.spacing_box.setSingleStep(0.05)
@@ -432,7 +463,25 @@ class MainWindow(QMainWindow):
         self.spacing_box.setSuffix(" mm")
         self.spacing_box.setValue(E.DEFAULT_SPACING_MM)
         self.spacing_box.valueChanged.connect(self.on_spacing)
-        v.addWidget(self.spacing_box)
+        fb.addWidget(self.spacing_box)
+        v.addWidget(self.fill_box)
+
+        # Grupo del satén: ancho de la línea
+        self.satin_box = QWidget()
+        sb = QVBoxLayout(self.satin_box)
+        sb.setContentsMargins(0, 0, 0, 0)
+        sb.setSpacing(6)
+        sb.addWidget(QLabel("Ancho del satén"))
+        self.satin_spin = QDoubleSpinBox()
+        self.satin_spin.setRange(0.5, 10)
+        self.satin_spin.setSingleStep(0.1)
+        self.satin_spin.setDecimals(1)
+        self.satin_spin.setSuffix(" mm")
+        self.satin_spin.setValue(self.satin_width)
+        self.satin_spin.valueChanged.connect(self.on_satin_width)
+        sb.addWidget(self.satin_spin)
+        sb.addWidget(self._hint("Las letras con borde grueso quedan mejor en satén (3 a 5 mm)."))
+        v.addWidget(self.satin_box)
 
         v.addWidget(QLabel("Color"))
         swatches = QGridLayout()
@@ -541,8 +590,12 @@ class MainWindow(QMainWindow):
     def set_mode(self, mode):
         self.canvas.mode = mode
         self.canvas.in_progress = []
-        self.btn_draw.setChecked(mode == "draw")
+        if mode != "select":
+            self.canvas.selected = -1      # al dibujar, nada queda seleccionado
+        self.btn_draw.setChecked(mode == "draw_fill")
+        self.btn_satin.setChecked(mode == "draw_satin")
         self.btn_select.setChecked(mode == "select")
+        self.sync_panel()
         self.canvas.update()
 
     def transform(self, deg, factor):
@@ -564,7 +617,7 @@ class MainWindow(QMainWindow):
         if self._updating or sh is None:
             return
         self.remember()
-        sh.kind = "fill" if idx == 0 else "run"
+        sh.kind = ("fill", "run", "satin")[idx]
         self.refresh()
 
     def on_angle(self, value):
@@ -573,6 +626,17 @@ class MainWindow(QMainWindow):
         if self._updating or sh is None:
             return
         sh.fill_angle = float(value)
+        self.refresh()
+
+    def on_satin_width(self, value):
+        if self._updating:
+            return
+        self.satin_width = float(value)
+        sh = self.selected_shape()
+        if sh is None or sh.kind != "satin":
+            return
+        self.remember()
+        sh.width = float(value)
         self.refresh()
 
     def on_spacing(self, value):
@@ -678,14 +742,20 @@ class MainWindow(QMainWindow):
         for b in self.sel_buttons:
             b.setEnabled(has)
         self.btn_delete.setEnabled(has)
-        self.kind_box.setEnabled(has)
         self.angle_slider.setEnabled(has)
         self.spacing_box.setEnabled(has)
+        self.satin_spin.setEnabled(has)
         if has:
-            self.kind_box.setCurrentIndex(0 if sh.kind == "fill" else 1)
+            self.kind_box.setCurrentIndex({"fill": 0, "run": 1, "satin": 2}[sh.kind])
             self.angle_slider.setValue(int(sh.fill_angle) % 180)
             self.spacing_box.setValue(sh.spacing)
+            self.satin_spin.setValue(sh.width if sh.kind == "satin" else self.satin_width)
             self.current_color = sh.color
+        # Mostrar solo los controles que sirven para lo que está activo.
+        satin_now = (has and sh.kind == "satin") or (not has and self.canvas.mode == "draw_satin")
+        self.fill_box.setVisible(not satin_now)
+        self.satin_box.setVisible(satin_now)
+        self.kind_box.setEnabled(has)
 
         has_bg = self.bg is not None
         for w in (self.bg_opacity, self.bg_width, self.bg_remove):
