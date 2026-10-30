@@ -87,6 +87,9 @@ class Canvas(QWidget):
         self._moved = False
         self._marq_base = set()   # selección previa al recuadro (con Shift)
         self._marq_now = (0.0, 0.0)
+        self.edit_idx = -1        # forma que se edita punto a punto
+        self.vsel = set()         # puntos seleccionados al editar: (anillo, punto)
+        self.reopen = None        # última forma cerrada: (puntos, índice), para reabrirla con Ctrl+Z
         self.setMinimumSize(760, 540)
         self.setFocusPolicy(Qt.StrongFocus)
 
@@ -121,6 +124,66 @@ class Canvas(QWidget):
                 hits.add(i)
         self.sel = self._marq_base | hits
         self.selected = max(self.sel) if self.sel else -1
+
+    # --- edición de puntos ---
+
+    def _edit_shape(self):
+        i = self.edit_idx
+        if 0 <= i < len(self.win.shapes):
+            return self.win.shapes[i]
+        return None
+
+    def _hit_vertex(self, x, y):
+        """Punto más cercano al clic (dentro de 7 px), como (anillo, punto)."""
+        sh = self._edit_shape()
+        if sh is None:
+            return None
+        tol = 7.0 / self.view()[0]
+        best, best_d = None, tol
+        for ri, ring in enumerate(sh.rings):
+            d = np.hypot(ring[:, 0] - x, ring[:, 1] - y)
+            vi = int(np.argmin(d))
+            if d[vi] <= best_d:
+                best, best_d = (ri, vi), d[vi]
+        return best
+
+    def _select_vertices_in_rect(self, a, b):
+        sh = self._edit_shape()
+        if sh is None:
+            return
+        rx0, rx1 = sorted((a[0], b[0]))
+        ry0, ry1 = sorted((a[1], b[1]))
+        hits = set()
+        for ri, ring in enumerate(sh.rings):
+            m = ((ring[:, 0] >= rx0) & (ring[:, 0] <= rx1)
+                 & (ring[:, 1] >= ry0) & (ring[:, 1] <= ry1))
+            hits |= {(ri, int(i)) for i in np.nonzero(m)[0]}
+        self.vsel = self._marq_base | hits
+
+    def _edit_press(self, e, x, y):
+        sh = self._edit_shape()
+        if sh is None:
+            return
+        shift = bool(e.modifiers() & Qt.ShiftModifier)
+        hit = self._hit_vertex(x, y)
+        if hit is not None:
+            if shift:
+                self.vsel ^= {hit}          # Shift + clic: suma o quita el punto
+                self.update()
+                return
+            if hit not in self.vsel:
+                self.vsel = {hit}
+            origs = {v: np.array(sh.rings[v[0]][v[1]], dtype=float) for v in self.vsel}
+            self._drag = ("verts", (x, y), origs, self.win.snapshot())
+        else:
+            # Espacio vacío: recuadro para elegir una parte de puntos.
+            self._marq_base = set(self.vsel) if shift else set()
+            if not shift:
+                self.vsel = set()
+            self._drag = ("vmarquee", (x, y), (x, y), None)
+            self._marq_now = (x, y)
+        self._moved = False
+        self.update()
 
     # --- vista: mm <-> píxeles ---
 
@@ -251,7 +314,7 @@ class Canvas(QWidget):
                        f"Diseño: {mx[0] - mn[0]:.0f} × {mx[1] - mn[1]:.0f} mm")
 
         # Recuadro de selección que se está dibujando.
-        if self._drag and self._drag[0] == "marquee":
+        if self._drag and self._drag[0] in ("marquee", "vmarquee"):
             x0, y0 = self._drag[1]
             x1, y1 = self._marq_now
             r = QRectF(QPointF(ox + x0 * s, oy + y0 * s),
@@ -259,6 +322,15 @@ class Canvas(QWidget):
             p.setPen(QPen(QColor("#2563eb"), 1, Qt.DashLine))
             p.setBrush(QColor(37, 99, 235, 30))
             p.drawRect(r)
+
+        sh_edit = self._edit_shape() if self.mode == "edit" else None
+        if sh_edit is not None:
+            p.setPen(QPen(QColor("#2563eb"), 1))
+            for ri, ring in enumerate(sh_edit.rings):
+                for vi, (x, y) in enumerate(ring):
+                    on = (ri, vi) in self.vsel
+                    p.setBrush(QColor("#2563eb") if on else QColor("white"))
+                    p.drawRect(QRectF(ox + x * s - 3.5, oy + y * s - 3.5, 7, 7))
 
         if self.in_progress:
             pts = np.asarray(self.in_progress, dtype=float)
@@ -342,6 +414,10 @@ class Canvas(QWidget):
             self.update()
             return
 
+        if self.mode == "edit":
+            self._edit_press(e, x, y)
+            return
+
         # modo mover / elegir
         shift = bool(e.modifiers() & Qt.ShiftModifier)
         hit = -1
@@ -394,12 +470,22 @@ class Canvas(QWidget):
         dx, dy = x - start[0], y - start[1]
         if dx or dy:
             self._moved = True
-        if kind == "shape":
+        if kind == "verts":
+            sh = self._edit_shape()
+            if sh is not None:
+                rings = [r.copy() for r in sh.rings]
+                for (ri, vi), p0 in orig.items():
+                    rings[ri][vi] = p0 + (dx, dy)
+                sh.rings = rings
+        elif kind == "shape":
             for i, rings in orig.items():
                 self.win.shapes[i].rings = [r + np.array([dx, dy]) for r in rings]
         elif kind == "marquee":
             self._marq_now = (x, y)
             self._select_in_rect(start, (x, y))
+        elif kind == "vmarquee":
+            self._marq_now = (x, y)
+            self._select_vertices_in_rect(start, (x, y))
         else:
             bg = self.win.bg
             bg["x"], bg["y"] = orig[0] + dx, orig[1] + dy
@@ -413,7 +499,7 @@ class Canvas(QWidget):
             self.win.push_history(before)
         self._drag = None
         self._dragged = set()
-        if kind == "marquee":
+        if kind in ("marquee", "vmarquee"):
             self.win.sync_panel()
         else:
             self.win.refresh()
@@ -432,6 +518,8 @@ class Canvas(QWidget):
             if self.in_progress:
                 self.in_progress = []
                 self.update()
+            elif self.mode == "edit":
+                self.win.set_mode("select")
             else:
                 self.clear_sel()
                 self.win.sync_panel()
@@ -447,6 +535,7 @@ class Canvas(QWidget):
         else:
             shape = E.Shape(pts, "fill")
         self.win.add_shape(shape)
+        self.reopen = ([tuple(p) for p in pts], len(self.win.shapes) - 1)
         self.in_progress = []
         self.select_only(len(self.win.shapes) - 1)
         self.win.sync_panel()
@@ -586,13 +675,20 @@ class MainWindow(QMainWindow):
         self.btn_select = QPushButton("✋  Mover / elegir")
         self.btn_select.setCheckable(True)
         self.btn_select.clicked.connect(lambda: self.set_mode("select"))
+        self.btn_edit = QPushButton("✎  Editar puntos")
+        self.btn_edit.setCheckable(True)
+        self.btn_edit.clicked.connect(lambda: self.set_mode("edit"))
         v.addWidget(self.btn_draw)
         v.addWidget(self.btn_satin)
         v.addWidget(self.btn_select)
+        v.addWidget(self.btn_edit)
         v.addWidget(self._hint("Forma: clic en cada punto; doble clic o Enter para cerrarla. "
+                               "Ctrl+Z quita el último punto, o reabre la forma si la cerraste mal. "
                                "Satén: clic en la línea; doble clic o Enter para terminar. "
                                "Para elegir varias: Shift + clic, o arrastra un recuadro "
-                               "en el espacio vacío. Ctrl+A elige todo."))
+                               "en el espacio vacío. Ctrl+A elige todo. "
+                               "Editar puntos: elige la forma, arrastra un recuadro sobre "
+                               "los puntos que sobran y presiona Supr."))
 
         # 2. Ajustar la forma elegida
         v.addWidget(self._title("2. Ajusta la forma elegida"))
@@ -747,6 +843,7 @@ class MainWindow(QMainWindow):
         return [s.copy() for s in self.shapes]
 
     def push_history(self, snap):
+        self.canvas.reopen = None       # cualquier cambio cierra la opción de reabrir
         self.history.append(snap)
         del self.history[:-50]
 
@@ -759,13 +856,33 @@ class MainWindow(QMainWindow):
         self.shapes.append(shape)
 
     def undo(self):
+        cv = self.canvas
+        if cv.mode.startswith("draw") and cv.in_progress:
+            cv.in_progress.pop()                 # quita el último punto
+            cv.update()
+            return
+        if cv.mode.startswith("draw") and cv.reopen is not None and self.history:
+            # Cerraste la forma sin querer: la reabrimos para seguir con sus puntos.
+            pts, idx = cv.reopen
+            cv.reopen = None
+            if idx == len(self.shapes) - 1:
+                self.shapes.pop()
+                self.history.pop()
+                cv.in_progress = pts
+                cv.clear_sel()
+                self.sync_panel()
+                return
         if not self.history:
             return
         self.shapes = self.history.pop()
-        self.canvas.clear_sel()
+        cv.vsel = set()
+        cv.clear_sel()
         self.sync_panel()
 
     def delete_selected(self):
+        if self.canvas.mode == "edit":
+            self.delete_vertices()
+            return
         idx = [i for i in sorted(self.canvas.sel) if i < len(self.shapes)]
         if not idx:
             return
@@ -775,16 +892,47 @@ class MainWindow(QMainWindow):
         self.canvas.clear_sel()
         self.sync_panel()
 
+    def delete_vertices(self):
+        """Borra los puntos seleccionados de la forma en edición (con Ctrl+Z se recuperan)."""
+        cv = self.canvas
+        sh = cv._edit_shape()
+        if sh is None or not cv.vsel:
+            return
+        self.remember()
+        min_pts = 2 if sh.kind == "satin" else 3
+        rings = []
+        for ri, ring in enumerate(sh.rings):
+            drop = sorted(vi for (r, vi) in cv.vsel if r == ri)
+            keep = np.delete(ring, drop, axis=0) if drop else ring
+            if len(keep) >= min_pts:
+                rings.append(keep)
+        cv.vsel = set()
+        if rings:
+            sh.rings = rings
+            self.sync_panel()
+        else:
+            # Se borraron todos los puntos: la forma desaparece.
+            self.shapes.pop(cv.edit_idx)
+            self.set_mode("select")
+
     def set_mode(self, mode):
-        self.canvas.mode = mode
-        self.canvas.in_progress = []
-        if mode != "select":
-            self.canvas.clear_sel()        # al dibujar, nada queda seleccionado
-        self.btn_draw.setChecked(mode == "draw_fill")
-        self.btn_satin.setChecked(mode == "draw_satin")
-        self.btn_select.setChecked(mode == "select")
+        if mode == "edit" and self.selected_shape() is None:
+            self.statusBar().showMessage("Primero haz clic en la forma que quieres editar.", 6000)
+            self.btn_edit.setChecked(self.canvas.mode == "edit")
+            return
+        cv = self.canvas
+        cv.mode = mode
+        cv.in_progress = []
+        cv.reopen = None
+        cv.vsel = set()
+        cv.edit_idx = cv.selected if mode == "edit" else -1
+        if mode not in ("select", "edit"):
+            cv.clear_sel()                 # al dibujar, nada queda seleccionado
+        for btn, m in ((self.btn_draw, "draw_fill"), (self.btn_satin, "draw_satin"),
+                       (self.btn_select, "select"), (self.btn_edit, "edit")):
+            btn.setChecked(mode == m)
         self.sync_panel()
-        self.canvas.update()
+        cv.update()
 
     def transform(self, deg, factor):
         shs = self.selected_shapes()
