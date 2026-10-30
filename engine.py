@@ -113,8 +113,9 @@ def _satin_line(center, width, density=SATIN_DENSITY_MM, step=STITCH_MM):
 class Shape:
     """Una forma del bordado.
 
-    kind: "fill" (relleno, llena la forma), "run" (contorno, una línea)
-          o "satin" (satén: una línea gruesa de `width` mm).
+    kind: "fill" (relleno, llena la forma), "run" (contorno, una línea),
+          "satin" (satén: una línea gruesa de `width` mm) o "raw" (puntadas
+          exactas de un .dst abierto: cada anillo es una línea que no se regenera).
     fill_angle: dirección de las líneas de relleno, en grados.
     """
 
@@ -137,6 +138,8 @@ class Shape:
     def is_valid(self):
         if self.kind == "satin":
             return len(self.rings) > 0 and len(self.rings[0]) >= 2
+        if self.kind == "raw":
+            return any(len(r) >= 2 for r in self.rings)
         return any(len(r) >= 3 for r in self.rings)
 
     def translate(self, dx, dy):
@@ -150,6 +153,19 @@ class Shape:
 
     def contains(self, x, y):
         """¿El punto está dentro de la forma? (regla par-impar; en satén, cerca de la línea)"""
+        if self.kind == "raw":
+            best = np.inf
+            for r in self.rings:
+                if len(r) == 1:
+                    best = min(best, math.hypot(r[0][0] - x, r[0][1] - y))
+                    continue
+                a, b = r[:-1], r[1:]
+                ab = b - a
+                den = np.maximum((ab ** 2).sum(axis=1), 1e-12)
+                t = np.clip(((np.array([x, y]) - a) * ab).sum(axis=1) / den, 0.0, 1.0)
+                proj = a + ab * t[:, None]
+                best = min(best, np.hypot(proj[:, 0] - x, proj[:, 1] - y).min())
+            return best <= 1.5
         if self.kind == "satin":
             c = self.rings[0]
             a, b = c[:-1], c[1:]
@@ -181,6 +197,8 @@ class Shape:
     def _compute(self, stitch):
         if not self.is_valid():
             return []
+        if self.kind == "raw":
+            return [r for r in self.rings if len(r) >= 1]   # puntadas tal cual
         if self.kind == "run":
             return [_subdivide(np.vstack([r, r[:1]]), stitch)
                     for r in self.rings if len(r) >= 2]
@@ -433,4 +451,36 @@ def svg_to_shapes(path, width_mm=150.0):
             shapes.append(Shape(scaled, "satin", color, width=max(0.5, sw * scale)))
         else:
             shapes.append(Shape(scaled, kind, color))
+    return shapes
+
+
+def dst_to_shapes(path, palette=None):
+    """Archivo .dst -> formas "raw", una por trazo de puntadas (sin cambios).
+
+    El .dst no guarda colores: se asignan en orden, uno por cada cambio de hilo.
+    """
+    pat = pe.read(path)
+    palette = palette or ["#1e3a8a", "#b91c1c", "#15803d", "#eab308",
+                          "#111827", "#ea580c", "#7e22ce", "#78350f"]
+    shapes, cur, k = [], [], 0
+
+    def flush():
+        if len(cur) >= 2:
+            line = np.array(cur, dtype=float) / 10.0      # décimas de mm -> mm
+            shapes.append(Shape([line], "raw", palette[k % len(palette)]))
+
+    for st in pat.stitches:
+        x, y, cmd = st[0], st[1], st[2]
+        if cmd == pe.END:
+            break
+        if cmd == pe.COLOR_CHANGE:
+            flush()
+            cur = []
+            k += 1
+        elif cmd == pe.JUMP:
+            flush()
+            cur = [(x, y)]
+        else:
+            cur.append((x, y))
+    flush()
     return shapes

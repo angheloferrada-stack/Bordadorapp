@@ -273,7 +273,9 @@ class Canvas(QWidget):
                 if len(r) >= 3:
                     path.addPolygon(self._poly(r, v))
                     path.closeSubpath()
-            if sh.kind == "satin":
+            if sh.kind == "raw":
+                pass                           # solo se ven sus puntadas (abajo)
+            elif sh.kind == "satin":
                 # La banda muestra el ancho real del satén (en píxeles).
                 band = QColor(col.red(), col.green(), col.blue(), 55)
                 p.setBrush(Qt.NoBrush)
@@ -298,7 +300,11 @@ class Canvas(QWidget):
             if i in self.sel:
                 p.setBrush(Qt.NoBrush)
                 p.setPen(QPen(QColor("#2563eb"), 2, Qt.DashLine))
-                p.drawPath(path)
+                if sh.kind == "raw":
+                    for r in sh.rings:
+                        p.drawPolyline(self._poly(r, v))
+                else:
+                    p.drawPath(path)
 
         # Medidas del diseño completo.
         b = E.bbox_of(self.win.shapes)
@@ -776,6 +782,12 @@ class MainWindow(QMainWindow):
         self.btn_import = QPushButton("🪄  Foto o vector → bordado")
         self.btn_import.clicked.connect(self.import_file)
         v.addWidget(self.btn_import)
+        self.btn_open = QPushButton("📂  Abrir bordado (.dst)")
+        self.btn_open.clicked.connect(self.open_dst)
+        v.addWidget(self.btn_open)
+        v.addWidget(self._hint("Abrir: un .dst ya hecho se vuelve editable. Cada trazo es una "
+                               "línea que puedes mover, borrar por partes o recolorear. "
+                               "El .dst no guarda colores: se asignan en orden."))
         v.addWidget(self._hint("Acepta .svg, .png o .jpg. Si tienes .ai o .pdf, "
                                "ábrelos en Inkscape y guárdalos como SVG."))
 
@@ -1095,6 +1107,36 @@ class MainWindow(QMainWindow):
                 "Revisa el resultado: el fondo también se borda. "
                 "Si no lo quieres, selecciónalo y bórralo.")
 
+    def open_dst(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Abrir bordado", "", "Tajima (*.dst)")
+        if not path:
+            return
+        if self.shapes:
+            r = QMessageBox.question(
+                self, "Reemplazar el diseño",
+                "Esto reemplaza el diseño actual (puedes deshacerlo con Ctrl+Z).\n¿Abrir el .dst?")
+            if r != QMessageBox.Yes:
+                return
+        self.load_dst(path)
+
+    def load_dst(self, path):
+        try:
+            shapes = E.dst_to_shapes(path)
+        except Exception as ex:  # noqa: BLE001 - mostramos el error al usuario
+            QMessageBox.warning(self, "No se pudo abrir", str(ex))
+            return
+        if not shapes:
+            QMessageBox.information(self, "Nada que abrir", "Ese archivo no tiene puntadas.")
+            return
+        self.remember()
+        hw, hh = self.hoop
+        E.center_shapes(shapes, hw / 2, hh / 2)
+        self.shapes = shapes
+        self.canvas.edit_idx = -1
+        self.canvas.clear_sel()
+        self.set_mode("select")
+        self.statusBar().showMessage(f"Abierto: {path}", 8000)
+
     def load_bg(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Elegir foto de fondo", "",
@@ -1139,20 +1181,21 @@ class MainWindow(QMainWindow):
             b.setEnabled(has)
         self.btn_delete.setEnabled(has)
         self.hole_btn.setEnabled(len(self.canvas.sel) == 2)
-        self.angle_slider.setEnabled(has)
-        self.spacing_box.setEnabled(has)
+        raw = has and sh.kind == "raw"       # trazo de un .dst: sin relleno ni satén
+        self.angle_slider.setEnabled(has and not raw)
+        self.spacing_box.setEnabled(has and not raw)
         self.satin_spin.setEnabled(has)
         if has:
-            self.kind_box.setCurrentIndex({"fill": 0, "run": 1, "satin": 2}[sh.kind])
+            self.kind_box.setCurrentIndex({"fill": 0, "run": 1, "satin": 2}.get(sh.kind, 0))
             self.angle_slider.setValue(int(sh.fill_angle) % 180)
             self.spacing_box.setValue(sh.spacing)
             self.satin_spin.setValue(sh.width if sh.kind == "satin" else self.satin_width)
             self.current_color = sh.color
         # Mostrar solo los controles que sirven para lo que está activo.
         satin_now = (has and sh.kind == "satin") or (not has and self.canvas.mode == "draw_satin")
-        self.fill_box.setVisible(not satin_now)
+        self.fill_box.setVisible(not satin_now and not raw)
         self.satin_box.setVisible(satin_now)
-        self.kind_box.setEnabled(has)
+        self.kind_box.setEnabled(has and not raw)
 
         has_bg = self.bg is not None
         for w in (self.bg_opacity, self.bg_width, self.bg_remove):
